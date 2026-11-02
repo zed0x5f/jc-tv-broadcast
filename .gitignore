@@ -1,0 +1,5 @@
+/target
+*.toml.tmp
+# MediaMTX auto-generated TLS material, never commit
+auto.crt
+auto.key

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=CastDesk
+GenericName=Virtual display streaming
+Comment=Add virtual displays and stream them to TVs and PCs on your LAN
+Exec=castdesk-tui
+Terminal=true
+Icon=video-display
+Categories=AudioVideo;Video;Network;Utility;
+Keywords=cast;stream;rtsp;tv;display;monitor;

@@ -1,0 +1,19 @@
+[Unit]
+Description=CastDesk virtual display streaming daemon
+Documentation=https://github.com/zed0x5f/jc-tv-broadcast
+# Needs the graphical session's environment (WAYLAND_DISPLAY / DISPLAY,
+# XDG_CURRENT_DESKTOP, session D-Bus) and PipeWire.
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service xdg-desktop-portal.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/castdeskd run
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target

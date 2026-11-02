@@ -1,0 +1,199 @@
+//! `~/.config/castdesk/config.toml`
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::api::{DisplaySpec, VideoSettings};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Config {
+    pub daemon: DaemonConfig,
+    pub mediamtx: MediaMtxConfig,
+    /// Defaults applied to new displays created without explicit settings.
+    pub defaults: VideoSettings,
+    /// Displays recreated every time the daemon starts.
+    #[serde(rename = "display")]
+    pub displays: Vec<DisplaySpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DaemonConfig {
+    /// Control API listen address. Keep it on loopback.
+    pub listen: String,
+    /// Address advertised in stream URLs. Empty = auto-detect LAN IP.
+    pub advertise_host: String,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:7650".into(),
+            advertise_host: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaMtxConfig {
+    /// Spawn and supervise MediaMTX. If false, an external server must be listening.
+    pub managed: bool,
+    /// Explicit binary path; otherwise ~/.local/share/castdesk/bin/mediamtx, then $PATH.
+    pub binary: Option<PathBuf>,
+    pub rtsp_port: u16,
+    pub api_port: u16,
+    /// RTP/RTCP UDP ports for UDP RTSP readers (open these in the firewall).
+    pub rtp_port: u16,
+    pub rtcp_port: u16,
+}
+
+impl Default for MediaMtxConfig {
+    fn default() -> Self {
+        Self {
+            managed: true,
+            binary: None,
+            rtsp_port: 8554,
+            api_port: 9997,
+            rtp_port: 8000,
+            rtcp_port: 8001,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("reading {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("parsing {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+    #[error("serializing config: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    #[error("{0}")]
+    Invalid(String),
+}
+
+impl Config {
+    /// Load the config, returning defaults if the file does not exist.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(source) => {
+                return Err(ConfigError::Io {
+                    path: path.into(),
+                    source,
+                });
+            }
+        };
+        let cfg: Config = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.into(),
+            source,
+        })?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let mut seen = std::collections::HashSet::new();
+        for d in &self.displays {
+            d.validate().map_err(ConfigError::Invalid)?;
+            if !seen.insert(&d.name) {
+                return Err(ConfigError::Invalid(format!("duplicate display {:?}", d.name)));
+            }
+        }
+        self.defaults.validate().map_err(ConfigError::Invalid)
+    }
+
+    /// Atomically write the config (write temp file, then rename).
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        let text = toml::to_string_pretty(self)?;
+        let io = |source| ConfigError::Io {
+            path: path.into(),
+            source,
+        };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(io)?;
+        }
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text).map_err(io)?;
+        std::fs::rename(&tmp, path).map_err(io)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::*;
+
+    #[test]
+    fn defaults_are_1080p60_low_latency() {
+        let v = VideoSettings::default();
+        assert_eq!((v.width, v.height, v.fps), (1920, 1080, 60));
+        assert!((8_000..=15_000).contains(&v.bitrate_kbps));
+        assert_eq!(v.gop_frames(), 60);
+        assert_eq!(v.codec, Codec::H264);
+    }
+
+    #[test]
+    fn roundtrip_toml() {
+        let mut cfg = Config::default();
+        let mut d = DisplaySpec::new("tv1");
+        d.video.codec = Codec::H265;
+        d.placement = Placement::LeftOf;
+        cfg.displays.push(d);
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn parses_minimal_user_file() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[display]]
+            name = "living-room"
+            width = 1280
+            height = 720
+            fps = 30
+            "#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let d = &cfg.displays[0];
+        assert_eq!(d.video.width, 1280);
+        assert_eq!(d.video.bitrate_kbps, 12_000);
+        assert_eq!(d.backend, BackendKind::Auto);
+    }
+
+    #[test]
+    fn rejects_bad_names_and_duplicates() {
+        assert!(validate_name("TV 1").is_err());
+        assert!(validate_name("").is_err());
+        assert!(validate_name("-x").is_err());
+        assert!(validate_name("tv_1-a").is_ok());
+        let mut cfg = Config::default();
+        cfg.displays.push(DisplaySpec::new("a"));
+        cfg.displays.push(DisplaySpec::new("a"));
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn save_and_load() {
+        let dir = std::env::temp_dir().join(format!("castdesk-test-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut cfg = Config::default();
+        cfg.displays.push(DisplaySpec::new("x"));
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), cfg);
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
