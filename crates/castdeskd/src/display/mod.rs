@@ -1,6 +1,10 @@
 //! Virtual display backends. Each creates an extra monitor using existing
 //! compositor/X mechanisms (no custom kernel code) and returns a capture source.
+//!
+//! Testing: only the `test` backend has run (self-test). `auto` fallback across
+//! real backends has never been exercised.
 
+pub mod evdi; // stub, stage (b)
 pub mod mutter;
 pub mod portal;
 pub mod wlroots;
@@ -107,6 +111,7 @@ pub async fn create(
             BackendKind::Wlroots => wlroots::WlrootsDisplay::create(spec, session).await.map(DisplayHandle::Wlroots),
             BackendKind::X11 => x11::X11Display::create(spec).await.map(DisplayHandle::X11),
             BackendKind::Test => Ok(DisplayHandle::Test(CaptureSource::Test)),
+            BackendKind::Evdi => evdi::create(spec).await,
             BackendKind::Auto => unreachable!(),
         };
         match res {

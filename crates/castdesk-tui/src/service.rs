@@ -1,4 +1,8 @@
 //! Local machine management: start/stop the daemon, read its logs, clipboard.
+//!
+//! Testing: only ANSI stripping is unit-tested. Starting/stopping the daemon
+//! (systemctl or background process), reading logs and the clipboard tools
+//! are untested.
 
 use std::io::Write;
 use std::path::PathBuf;

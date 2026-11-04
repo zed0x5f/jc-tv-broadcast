@@ -5,6 +5,9 @@
 //!
 //! Only right-of / below placement is supported: X coordinates can't be
 //! negative, and shifting the physical outputs would move your laptop screen.
+//!
+//! Testing: xrandr output parsing and region math are unit-tested. The xrandr
+//! commands and ximagesrc capture have never run against a real X server.
 
 use anyhow::{Context, Result, anyhow, bail};
 use castdesk_core::{DisplaySpec, Placement};

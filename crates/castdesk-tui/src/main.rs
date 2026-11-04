@@ -1,4 +1,8 @@
 //! castdesk-tui — terminal front end for castdeskd.
+//!
+//! Testing: rendering and the add-display form are unit-tested with ratatui's
+//! TestBackend and canned daemon data. The TUI has never been run against a
+//! live daemon by any automated test.
 
 mod app;
 mod form;

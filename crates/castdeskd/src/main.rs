@@ -1,11 +1,19 @@
 //! castdeskd — CastDesk daemon: virtual displays → one encode → network streams.
+//!
+//! Testing: `run` is exercised by `scripts/selftest-stage-a.sh` (headless,
+//! test backend). `doctor` has been run in a headless container only: there
+//! was no desktop session and no GPU, so only x264/x265 were probed.
 
 mod api;
+mod audio; // stub, stage (b)
+mod destinations; // stub, stage (b)
 mod display;
 mod encoder;
 mod manager;
 mod mediamtx;
+mod overlay; // stub, stage (b)
 mod pipeline;
+mod remote; // stub, stage (c)
 mod session;
 
 use std::net::{IpAddr, UdpSocket};

@@ -1,4 +1,7 @@
 //! Detect the graphical session and decide which virtual-display backends to try.
+//!
+//! Testing: detection logic is unit-tested with synthetic environments (GNOME,
+//! KDE, Sway, X11, headless). Never run inside a real desktop session.
 
 use std::collections::HashMap;
 

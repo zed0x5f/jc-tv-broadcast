@@ -1,4 +1,6 @@
 //! Async client for the daemon's localhost control API.
+//!
+//! Testing: no automated tests (the self-test uses curl, not this client).
 
 use std::time::Duration;
 

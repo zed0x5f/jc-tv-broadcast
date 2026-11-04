@@ -7,6 +7,9 @@
 //!
 //! The first run shows a permission dialog; we save the restore token per
 //! display so later starts are silent (PersistMode::ExplicitlyRevoked).
+//!
+//! Testing: none. No unit tests, and never run against KDE or GNOME portals.
+//! Restore-token persistence is unverified.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

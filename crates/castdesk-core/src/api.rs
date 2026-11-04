@@ -50,9 +50,13 @@ pub enum BackendKind {
     X11,
     /// Synthetic test pattern, no display (headless verification).
     Test,
+    /// STUB (stage b): DisplayLink evdi kernel module. Not implemented; the
+    /// daemon rejects it. Left out of `ALL` so front ends don't offer it.
+    Evdi,
 }
 
 impl BackendKind {
+    /// Backends a front end should offer. Excludes unimplemented stubs.
     pub const ALL: [BackendKind; 6] = [
         BackendKind::Auto,
         BackendKind::Mutter,
@@ -69,6 +73,7 @@ impl BackendKind {
             BackendKind::Wlroots => "wlroots",
             BackendKind::X11 => "x11",
             BackendKind::Test => "test",
+            BackendKind::Evdi => "evdi",
         }
     }
 }
@@ -153,6 +158,43 @@ impl VideoSettings {
     }
 }
 
+/// Marker for features that are declared but not built yet. Validation
+/// rejects them with this message so nothing silently does nothing.
+pub fn not_implemented(feature: &str, stage: &str) -> String {
+    format!("{feature} is not implemented yet (planned for stage {stage})")
+}
+
+/// STUB (stage b): an extra network output fed from the display's encoder
+/// `tee`, next to the RTSP publish. Only the config shape exists; any entry
+/// is rejected by [`DisplaySpec::validate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Destination {
+    /// SRT listener: receivers connect to srt://<host>:<port>.
+    Srt {
+        port: u16,
+        #[serde(default = "default_srt_latency")]
+        latency_ms: u32,
+        #[serde(default)]
+        passphrase: Option<String>,
+    },
+    /// MPEG-TS over UDP, to a unicast host or a multicast group.
+    Udp {
+        host: String,
+        port: u16,
+        /// Multicast TTL (ignored for unicast).
+        #[serde(default = "default_ttl")]
+        ttl: u32,
+    },
+}
+
+fn default_srt_latency() -> u32 {
+    120
+}
+fn default_ttl() -> u32 {
+    1
+}
+
 /// A virtual display and its stream, as configured by the user.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DisplaySpec {
@@ -164,6 +206,19 @@ pub struct DisplaySpec {
     pub placement: Placement,
     #[serde(flatten)]
     pub video: VideoSettings,
+    /// STUB (stage b): SRT / UDP outputs. Must be empty for now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destinations: Vec<Destination>,
+    /// STUB (stage b): capture desktop audio (PipeWire sink monitor). Must be false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub audio: bool,
+    /// STUB (stage b): burn a latency-test overlay into the stream. Must be false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub latency_overlay: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl DisplaySpec {
@@ -173,12 +228,29 @@ impl DisplaySpec {
             backend: BackendKind::Auto,
             placement: Placement::RightOf,
             video: VideoSettings::default(),
+            destinations: Vec::new(),
+            audio: false,
+            latency_overlay: false,
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
         validate_name(&self.name)?;
-        self.video.validate()
+        self.video.validate()?;
+        // Stage (b) stubs: reject rather than accept-and-ignore.
+        if self.backend == BackendKind::Evdi {
+            return Err(not_implemented("the evdi backend", "b"));
+        }
+        if !self.destinations.is_empty() {
+            return Err(not_implemented("SRT/UDP destination support", "b"));
+        }
+        if self.audio {
+            return Err(not_implemented("audio", "b"));
+        }
+        if self.latency_overlay {
+            return Err(not_implemented("the latency overlay", "b"));
+        }
+        Ok(())
     }
 }
 

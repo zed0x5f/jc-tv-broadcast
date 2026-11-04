@@ -1,4 +1,7 @@
 //! Well-known file locations (XDG).
+//!
+//! Testing: no unit tests. The `CASTDESK_CONFIG` / `CASTDESK_RUNTIME_DIR`
+//! overrides are used by the self-test.
 
 use std::path::PathBuf;
 

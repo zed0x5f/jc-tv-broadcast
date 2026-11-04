@@ -4,6 +4,8 @@
 //! sizes it from the video format the consumer negotiates — so the pipeline
 //! asks pipewiresrc for exactly width×height. No portal dialog is involved.
 //! The monitor disappears when we call Stop or our D-Bus connection drops.
+//!
+//! Testing: none. No unit tests, and never run against a GNOME session.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -102,6 +104,16 @@ impl MutterDisplay {
             _conn: conn,
             session,
         })
+    }
+
+    /// STUB (stage b): place the virtual monitor via
+    /// `org.gnome.Mutter.DisplayConfig` (GetCurrentState → ApplyMonitorsConfig
+    /// with the new logical monitor at the requested side). Until then the
+    /// `placement` setting is ignored on GNOME and the user arranges the
+    /// monitor in Settings → Displays.
+    #[allow(dead_code)] // not wired until stage (b)
+    pub async fn apply_placement(&self, _placement: castdesk_core::Placement) -> Result<()> {
+        Err(anyhow!(castdesk_core::not_implemented("Mutter monitor placement", "b")))
     }
 
     pub async fn stop(self) -> Result<()> {

@@ -1,4 +1,7 @@
 //! `~/.config/castdesk/config.toml`
+//!
+//! Testing: defaults, TOML round trip, minimal user file, validation, save/load
+//! and stage (b) stub rejection are unit-tested.
 
 use std::path::{Path, PathBuf};
 
@@ -184,6 +187,44 @@ mod tests {
         cfg.displays.push(DisplaySpec::new("a"));
         cfg.displays.push(DisplaySpec::new("a"));
         assert!(cfg.validate().is_err());
+    }
+
+    /// Stage (b) options parse (so the config shape is settled) but are
+    /// rejected until implemented, instead of being silently ignored.
+    #[test]
+    fn stage_b_stubs_parse_but_are_rejected() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[display]]
+            name = "tv1"
+            audio = true
+            [[display.destinations]]
+            kind = "srt"
+            port = 9000
+            [[display.destinations]]
+            kind = "udp"
+            host = "239.0.0.1"
+            port = 5004
+            "#,
+        )
+        .unwrap();
+        let d = &cfg.displays[0];
+        assert_eq!(d.destinations.len(), 2);
+        assert!(matches!(d.destinations[0], Destination::Srt { latency_ms: 120, .. }));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("not implemented"), "{err}");
+
+        for spec in [
+            DisplaySpec { audio: true, ..DisplaySpec::new("a") },
+            DisplaySpec { latency_overlay: true, ..DisplaySpec::new("a") },
+            DisplaySpec { backend: BackendKind::Evdi, ..DisplaySpec::new("a") },
+        ] {
+            assert!(spec.validate().unwrap_err().contains("not implemented"));
+        }
+        // Defaults stay out of the saved file.
+        let text = toml::to_string(&DisplaySpec::new("a")).unwrap();
+        assert!(!text.contains("audio") && !text.contains("destinations"));
+        assert!(!BackendKind::ALL.contains(&BackendKind::Evdi));
     }
 
     #[test]

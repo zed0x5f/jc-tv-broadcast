@@ -4,6 +4,11 @@
 # display, then verifies the RTSP stream the way a receiver would.
 #
 #   scripts/selftest-stage-a.sh [path/to/mediamtx]
+#
+# What it does NOT cover: any real virtual-display backend (it uses
+# backend = "test"), a specific encoder (it uses whatever `auto` picks:
+# x264enc on a machine without a GPU),
+# the TUI, or receivers other than ffprobe/ffmpeg.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MTX="${1:-$(command -v mediamtx || echo "${XDG_DATA_HOME:-$HOME/.local/share}/castdesk/bin/mediamtx")}"

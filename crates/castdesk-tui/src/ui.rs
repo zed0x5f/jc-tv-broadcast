@@ -1,4 +1,7 @@
 //! Rendering.
+//!
+//! Testing: covered by the TestBackend tests in `main.rs` (connected,
+//! disconnected, failed display, tiny terminal).
 
 use std::time::Duration;
 

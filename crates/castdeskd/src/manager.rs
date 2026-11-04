@@ -1,6 +1,13 @@
 //! Owns all displays. Each display runs as its own task ("actor") that:
 //! creates the virtual monitor → builds the pipeline → watches the bus →
 //! samples stats → restarts with backoff on failure.
+//!
+//! Testing: no unit tests. The self-test covers add → running, live stats
+//! (bitrate/fps within 25%), recovery after MediaMTX is killed, remove, and the
+//! config file update. Not covered: recreating the virtual display after
+//! repeated failures, `restart`, and startup with displays already in the
+//! config file. Shutdown happens when the self-test sends SIGTERM at the end,
+//! but nothing checks the result.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;

@@ -1,5 +1,8 @@
 //! TUI state and input handling. Network calls run on tokio tasks and report
 //! back through a channel, so the UI never blocks on the daemon.
+//!
+//! Testing: covered indirectly by the TestBackend tests in `main.rs`. The
+//! network tasks (calls to the daemon) are not tested.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};

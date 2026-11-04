@@ -7,6 +7,12 @@
 //! GET    /api/v1/displays/{name}
 //! DELETE /api/v1/displays/{name}
 //! POST   /api/v1/displays/{name}/restart
+//! GET    /api/v1/control                STUB (stage c): always 501 Not Implemented
+//!
+//! Testing: no unit tests for the router. `scripts/selftest-stage-a.sh`
+//! covers: 401 without a token, POST /displays, GET /displays/{name},
+//! DELETE /displays/{name}. Not covered by any test: /health, /system,
+//! GET /displays, /restart, /control.
 
 use std::sync::Arc;
 
@@ -71,6 +77,7 @@ pub fn router(state: AppState) -> Router {
         .route("/displays", get(list).post(add))
         .route("/displays/{name}", get(one).delete(remove))
         .route("/displays/{name}/restart", post(restart))
+        .route("/control", get(crate::remote::control_ws::handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     Router::new()
         .nest(

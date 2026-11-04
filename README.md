@@ -2,12 +2,14 @@
 
 Add virtual extra displays to a Linux laptop and stream each one to many LAN
 receivers at once: VLC, mpv / Raspberry Pi, Android TV, and a custom Media3 app.
-It's all Rust: `castdeskd` (daemon) + `castdesk-tui` (terminal UI), with a GTK
-widget and the soft remote coming in later stages.
+It's all Rust: `castdeskd` (daemon) + `castdesk-tui` (terminal UI), with the
+soft remote coming in a later stage.
 
 > **Status: stage (a) — virtual display + RTSP stream + TUI.**
-> SRT/UDP fan-out, audio, latency overlay, GUI and the soft remote are next
-> (see [Roadmap](#roadmap)).
+> Only the headless path has been tested end to end; the real desktop backends
+> and hardware encoders have not (see [Test status](#test-status)).
+> SRT/UDP fan-out, audio, latency overlay and the soft remote are stubbed out
+> and next (see [Roadmap](#roadmap)).
 
 ```mermaid
 flowchart LR
@@ -38,7 +40,7 @@ flowchart LR
   mismatch across distros. `gstreamer-rs`, `zbus` and `ashpd` are maintained
   and complete. Video never passes through our code (it stays in GStreamer's C
   threads), so the language only affects control logic. The cost: there's no
-  Rust Android TV Remote v2 library, so stage (d) implements that protocol
+  Rust Android TV Remote v2 library, so stage (c) implements that protocol
   itself.
 - **One encode per display, then `tee`.** Destinations are branches after the
   encoder. Adding or removing one never re-encodes or restarts the capture.
@@ -58,7 +60,7 @@ flowchart LR
 | KDE Plasma 6 Wayland (and GNOME fallback) | `portal` | xdg-desktop-portal ScreenCast, source type **VIRTUAL** | Standard API. One permission dialog the first time; after that a restore token (in `~/.local/state/castdesk/portal-tokens.json`) makes it silent. The compositor decides the initial mode; we scale to your resolution. |
 | Sway / Hyprland | `wlroots` | `swaymsg create_output` / `hyprctl output create headless`, then portal MONITOR capture | Exact mode and position control. xdg-desktop-portal-wlr shows an output chooser the first time (pick `HEADLESS-n`). |
 | X11 (any WM) | `x11` | `xrandr --fb` grows the root window; `xrandr --setmonitor CastDesk-<name> … none` declares a RandR monitor on the new area; `ximagesrc` captures it | Needs no driver. Right-of / below only. WMs must honour RandR 1.5 monitors (GNOME/KDE/XFCE/i3 do). The area isn't scanned out, so capture uses CPU copies. |
-| any | `evdi` | DisplayLink's evdi kernel module creates a real DRM connector | **Stage (b+), needs root + DKMS** (and MOK signing with Secure Boot). Only if none of the above work for you. |
+| any | `evdi` | DisplayLink's evdi kernel module creates a real DRM connector | **Stub, planned for stage (b).** Rejected as not implemented today. Will need root + DKMS (and MOK signing with Secure Boot). Only if none of the above work for you. |
 | headless | `test` | SMPTE bars + running clock | For verifying the network path without touching your desktop. |
 
 Capture is PipeWire (`pipewiresrc`) on Wayland and `ximagesrc` on X11.
@@ -92,7 +94,7 @@ See [docs/dependencies.md](docs/dependencies.md) for how it works.
 ```bash
 packaging/install.sh --check-only  # just report what's missing
 packaging/install.sh --yes         # no prompts
-packaging/install.sh --with-evdi   # include the optional evdi kernel module
+packaging/install.sh --with-evdi   # include the optional evdi kernel module (the evdi backend is still a stub)
 castdesk-deps                      # re-check later (new GPU/driver/desktop); -v shows skipped items
 castdesk-deps --session x11 --gpu nvidia   # check for a different setup, e.g. over SSH
 ```
@@ -125,6 +127,12 @@ codec = "h264"              # h264 | h265
 encoder = "auto"            # auto | vaapi | nvenc | software
 gop_seconds = 1.0
 ```
+
+Stage (b) settings already parse but are **rejected as not implemented**, so
+they can't silently do nothing: `destinations = [...]` (SRT/UDP), `audio = true`,
+`latency_overlay = true` and `backend = "evdi"`. A config file that contains
+any of them stops the daemon from starting, with an error that names the
+setting.
 
 ## Using the TUI
 
@@ -192,6 +200,26 @@ TUI's client count goes up for each viewer.
 come back to `running` within about 3 s. Viewers reconnect: mpv/ffplay do it
 on their own; VLC needs a replay.
 
+## Test status
+
+What has actually been run, as of this commit. Each source file's header
+comment says the same thing for that file.
+
+| Area | Tested | Not tested |
+|---|---|---|
+| Config, validation, stage (b) stub rejection | unit tests | — |
+| Session detection | unit tests (synthetic GNOME/KDE/Sway/X11/headless env) | inside a real desktop session |
+| `mutter` / `portal` backends | — | **never run** against GNOME or KDE |
+| `wlroots` / `x11` backends | unit tests for output parsing and placement math | **never run** against Sway, Hyprland or an X server |
+| `test` backend → x264enc → MediaMTX → RTSP | `scripts/selftest-stage-a.sh`: all 9 checks pass (Ubuntu 24.04 container, GStreamer 1.24.2, MediaMTX v1.21.3, no GPU) | — |
+| Encoders | x264enc/x265enc probe + encode; selection logic unit-tested | VA-API and NVENC on real hardware |
+| Daemon supervision | self-test: MediaMTX kill → back to `running` | recreating the virtual display after repeated failures; `restart` endpoint |
+| Control API | self-test: 401 without token, add/get/delete display | `/system`, `/health`, list, `restart` |
+| TUI | rendering + add form (ratatui TestBackend, canned data) | against a live daemon; start/stop daemon, logs, clipboard |
+| Dependency checker | 19 Python tests on faked machines | `install.sh` end to end. Its MediaMTX checksum step was run alone and fixed. |
+| Receivers | ffprobe/ffmpeg over RTSP TCP and UDP (self-test) | VLC, mpv, Raspberry Pi, Android TV |
+| Stage (b)/(c) stubs | each stub's "not implemented" error | — (no functionality yet) |
+
 ## Setup notes per desktop
 
 - **GNOME (Wayland):** nothing extra. If the log says `AccessDenied` on
@@ -235,11 +263,16 @@ crates/castdeskd       daemon: session detection, display backends, encoders, pi
 crates/castdesk-tui    ratatui front end
 packaging/             install.sh, deps.toml + castdesk-deps (runtime dependency detection),
                        systemd user unit, .desktop file
-docs/                  dependencies.md
+docs/                  dependencies.md, control-protocol.md (draft, stage c)
+receivers/media3/      placeholder for the Android receiver app (stage c, no code yet)
 scripts/               selftest-stage-a.sh (headless end-to-end check)
 ```
 
-Development: `cargo test --workspace` (30 tests; the GStreamer ones need
+Stubs are marked `STUB (stage x)` in the code and return a "not implemented
+yet" error: `destinations.rs`, `audio.rs`, `overlay.rs`, `display/evdi.rs`,
+`MutterDisplay::apply_placement` (stage b), and `remote/` (stage c).
+
+Development: `cargo test --workspace` (35 tests; the GStreamer ones need
 x264enc/rtspclientsink installed), `python3 -m unittest discover -s packaging/tests`
 (19 tests), `cargo clippy --workspace --all-targets`.
 
@@ -259,7 +292,9 @@ curl -H "Authorization: Bearer $T" -XDELETE localhost:7650/api/v1/displays/tv2
 
 ## Roadmap
 
-- [x] **(a)** virtual display (Mutter / portal / wlroots / X11) → one encode → RTSP via MediaMTX; health monitoring + auto-restart; TUI
-- [ ] **(b)** SRT listener + MPEG-TS UDP unicast/multicast branches, toggled live with no encoder restart; audio (PipeWire sink monitor → AAC/Opus); latency-test overlay; Mutter placement via DisplayConfig; evdi backend
-- [ ] **(c)** GTK4 widget + tray: destination toggles, receiver discovery (mDNS + ADB), "Send to…"
-- [ ] **(d)** soft remote: ADB → Android TV Remote v2 (own Rust implementation) → CastDesk WebSocket protocol (`docs/control-protocol.md`) + Kotlin/Media3 stub; optional CEC
+- [x] **(a)** virtual display (Mutter / portal / wlroots / X11) → one encode → RTSP via MediaMTX; health monitoring + auto-restart; TUI. Code complete; only the headless path is tested (see [Test status](#test-status))
+- [ ] **(b)** *(stubbed)* SRT listener + MPEG-TS UDP unicast/multicast branches, toggled live with no encoder restart; audio (PipeWire sink monitor → AAC/Opus); latency-test overlay; Mutter placement via DisplayConfig; evdi backend
+- [ ] **(c)** *(stubbed)* soft remote: ADB → Android TV Remote v2 (own Rust implementation) → CastDesk WebSocket protocol (`docs/control-protocol.md`) + Kotlin/Media3 receiver (`receivers/media3/`); optional CEC
+
+The GTK4 widget / tray stage was dropped. The TUI and the REST API are the
+front ends.

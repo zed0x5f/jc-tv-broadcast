@@ -12,6 +12,14 @@
 # Dependencies are not hardcoded here: packaging/castdesk-deps probes this
 # machine (session type, desktop, GPU/driver) against packaging/deps.toml
 # and resolves what's missing to packages your apt sources can provide.
+#
+# --with-evdi only installs the kernel module. The evdi display backend in
+# castdeskd is still a stub (stage b) and rejects `backend = "evdi"`.
+#
+# Testing: this script has never been run end to end by any automated test.
+# The MediaMTX download + checksum step was run on its own against v1.21.3
+# (it found and fixed the "*<file>" checksum-format bug). castdesk-deps has
+# its own unit tests (packaging/tests), which run against faked machines.
 set -euo pipefail
 
 MEDIAMTX_VERSION="v1.21.3"
@@ -105,7 +113,8 @@ if [[ $want_mtx == 1 ]]; then
     say "downloading MediaMTX $MEDIAMTX_VERSION ($arch)"
     curl -fsSL -o "$tmp/$tarball" "$base/$tarball"
     curl -fsSL -o "$tmp/checksums.sha256" "$base/checksums.sha256"
-    (cd "$tmp" && grep " $tarball\$" checksums.sha256 | sha256sum -c -) \
+    # Upstream lists "<hash> *<file>" (binary-mode marker), so allow the '*'.
+    (cd "$tmp" && grep -E " \*?${tarball//./\\.}\$" checksums.sha256 | sha256sum -c -) \
       || die "MediaMTX checksum mismatch, not installing"
     tar -xzf "$tmp/$tarball" -C "$tmp" mediamtx
     mkdir -p "$DATA/bin"

@@ -1,4 +1,6 @@
 //! "Add display" form.
+//!
+//! Testing: defaults, field cycling and name validation are unit-tested.
 
 use castdesk_core::{BackendKind, Codec, DisplaySpec, EncoderPref, Placement, VideoSettings};
 
@@ -129,6 +131,10 @@ impl AddForm {
                 encoder,
                 ..Default::default()
             },
+            // Stage (b) stubs, not offered in the form yet.
+            destinations: Vec::new(),
+            audio: false,
+            latency_overlay: false,
         };
         spec.validate()?;
         Ok(spec)

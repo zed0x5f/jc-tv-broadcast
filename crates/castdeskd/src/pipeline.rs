@@ -3,7 +3,14 @@
 //!
 //! Stage (a) has a single destination (RTSP publish to MediaMTX). The tee is
 //! already in place so stage (b) adds SRT/UDP branches without touching the
-//! encoder.
+//! encoder. Those branches, audio and the latency overlay are stubs for now:
+//! see `destinations.rs`, `audio.rs` and `overlay.rs`.
+//!
+//! Testing: gst-launch strings are unit-tested for every source and encoder
+//! variant, and a full pipeline is built with x264enc. The only source run
+//! end-to-end (self-test) is `Test` (videotestsrc) + x264enc + rtspclientsink.
+//! The PipeWire and X11 sources are string-tested only and have never captured
+//! a real screen.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

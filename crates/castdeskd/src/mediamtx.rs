@@ -3,6 +3,12 @@
 //! castdeskd publishes each display to rtsp://127.0.0.1:8554/<name>; MediaMTX
 //! fans it out to any number of RTSP readers (UDP or TCP interleaved).
 //! Publishing is restricted to localhost so nobody on the LAN can hijack a path.
+//!
+//! Testing: version parsing and the generated config (publish restricted to
+//! localhost) are unit-tested. Supervision is exercised by the self-test
+//! against MediaMTX v1.21.3: startup, readers over TCP and UDP, and restart
+//! after the process is killed. `managed = false` (bring your own server) is
+//! untested.
 
 use std::path::PathBuf;
 use std::process::Stdio;

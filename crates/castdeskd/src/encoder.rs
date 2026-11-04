@@ -3,6 +3,11 @@
 //! Preference: VA-API (Intel/AMD) → NVENC (NVIDIA) → x264/x265. Every candidate
 //! is probed with a tiny real encode at startup because "element exists" does
 //! not imply "driver works" (missing VA driver, NVENC session limits, etc.).
+//!
+//! Testing: the selection logic and per-encoder property sets are unit-tested.
+//! Real probes and encodes have run only for the software encoders (x264enc,
+//! x265enc). x264enc is also used end-to-end by the self-test. The VA-API and
+//! NVENC candidates have never run on real hardware.
 
 use anyhow::{Context, Result, anyhow};
 use castdesk_core::{Codec, EncoderInfo, EncoderPref, VideoSettings};

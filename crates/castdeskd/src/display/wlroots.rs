@@ -3,6 +3,10 @@
 //!
 //! xdg-desktop-portal-wlr shows an output chooser on first use; pick the
 //! `HEADLESS-n` output. To skip the chooser, see README "Sway".
+//!
+//! Testing: output-list parsing and placement math are unit-tested.
+//! The swaymsg/hyprctl commands and the portal capture have never run against
+//! a real Sway or Hyprland session.
 
 use anyhow::{Context, Result, anyhow, bail};
 use castdesk_core::{DisplaySpec, Placement, SessionInfo};
