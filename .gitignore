@@ -3,3 +3,4 @@
 # MediaMTX auto-generated TLS material, never commit
 auto.crt
 auto.key
+__pycache__/

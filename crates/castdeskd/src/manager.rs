@@ -242,11 +242,10 @@ impl Actor {
                     }
                     failures += 1;
                     tracing::warn!(display = %name, failures, "pipeline failed: {error}");
-                    if display_gone || failures % RECREATE_DISPLAY_AFTER == 0 {
-                        if let Some(d) = display.take() {
+                    if (display_gone || failures.is_multiple_of(RECREATE_DISPLAY_AFTER))
+                        && let Some(d) = display.take() {
                             d.remove().await;
                         }
-                    }
                     self.set_state(DisplayState::Restarting {
                         attempt: failures,
                         last_error: error,

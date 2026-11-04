@@ -137,7 +137,7 @@ impl VideoSettings {
         if !(320..=7680).contains(&self.width) || !(240..=4320).contains(&self.height) {
             return Err(format!("resolution {}x{} out of range", self.width, self.height));
         }
-        if self.width % 2 != 0 || self.height % 2 != 0 {
+        if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
             return Err("width and height must be even".into());
         }
         if !(1..=144).contains(&self.fps) {

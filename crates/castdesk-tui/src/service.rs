@@ -92,8 +92,8 @@ pub fn stop_daemon() -> Result<String, String> {
 }
 
 pub fn read_logs(lines: usize) -> Vec<String> {
-    if unit_installed() {
-        if let Ok(out) = Command::new("journalctl")
+    if unit_installed()
+        && let Ok(out) = Command::new("journalctl")
             .args(["--user", "-u", UNIT, "-n", &lines.to_string(), "--no-pager", "-o", "short-iso"])
             .output()
         {
@@ -103,7 +103,6 @@ pub fn read_logs(lines: usize) -> Vec<String> {
                 return v;
             }
         }
-    }
     match std::fs::read_to_string(fallback_log()) {
         Ok(t) => {
             let all: Vec<String> = t.lines().map(strip_ansi).collect();

@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+"""castdesk-deps: work out at runtime what CastDesk needs on *this* machine.
+
+Detects distro, session type/desktop, GPUs and drivers, then runs every
+applicable probe from deps.toml and maps failures to installable packages
+(checking apt can actually supply them). Optionally installs them.
+
+  castdesk-deps                      check everything that applies, human output
+  castdesk-deps --phase build        only build prerequisites
+  castdesk-deps --install            check, then offer to apt-get install what's missing
+  castdesk-deps --json               machine-readable report (used by install.sh)
+  castdesk-deps --with evdi          include optional features
+  castdesk-deps env                  print the detected environment
+  castdesk-deps which rust           print the path of a satisfying tool (exit 1 if none)
+
+Exit status: 0 = all required deps OK, 1 = something required is missing,
+2 = usage/manifest error. Standard library only (Python >= 3.11).
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import glob
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+if sys.version_info < (3, 11):
+    sys.exit("castdesk-deps needs Python >= 3.11 (for tomllib); Ubuntu 24.04 ships 3.12")
+import tomllib
+
+LEVELS = ("required", "recommended", "optional")
+PHASES = ("build", "install", "runtime")
+PROBE_KINDS = {"binary", "version", "toolchain", "pkgconfig", "gst-element", "file",
+               "dbus-name", "command", "access", "kmod"}
+WHEN_KEYS = {"session", "desktop", "gpu", "gpu_driver"}
+PCI_VENDORS = {"0x8086": "intel", "0x1002": "amd", "0x1022": "amd", "0x10de": "nvidia"}
+
+
+# ───────────────────────────── shell access (mockable) ─────────────────────────────
+
+class System:
+    """Every interaction with the machine goes through here so tests can fake it."""
+
+    def run(self, cmd: list[str], timeout: float = 20) -> tuple[int, str]:
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                               env={**os.environ, "LC_ALL": "C"})
+            return p.returncode, (p.stdout or "") + (p.stderr or "")
+        except FileNotFoundError:
+            return 127, f"{cmd[0]}: not found"
+        except subprocess.TimeoutExpired:
+            return 124, f"{cmd[0]}: timed out"
+
+    def which(self, name: str) -> str | None:
+        if "/" in name:
+            return name if os.access(name, os.X_OK) and os.path.isfile(name) else None
+        return shutil.which(name)
+
+    def glob(self, pattern: str) -> list[str]:
+        return sorted(glob.glob(pattern))
+
+    def access_rw(self, path: str) -> bool:
+        return os.access(path, os.R_OK | os.W_OK)
+
+    def read(self, path: str) -> str | None:
+        try:
+            return Path(path).read_text()
+        except OSError:
+            return None
+
+    def readlink(self, path: str) -> str | None:
+        try:
+            return os.readlink(path)
+        except OSError:
+            return None
+
+    def environ(self) -> dict[str, str]:
+        return dict(os.environ)
+
+
+# ─────────────────────────────── environment detection ───────────────────────────────
+
+@dataclass
+class Gpu:
+    card: str
+    vendor: str
+    driver: str
+
+
+@dataclass
+class Env:
+    distro: str = "unknown"
+    distro_version: str = ""
+    family: str | None = None          # apt | dnf | pacman
+    arch: str = platform.machine()
+    multiarch: str = ""
+    kernel: str = platform.release()
+    session: str = "unknown"           # wayland | x11 | tty | unknown
+    desktop: str = "unknown"
+    session_source: str = "none"       # env | loginctl | override | none
+    gpus: list[Gpu] = field(default_factory=list)
+    nvidia_major: str | None = None
+    home: str = str(Path.home())
+    data: str = ""
+    user_bus: bool = False
+    display: bool = False
+    root: bool = False
+    features: list[str] = field(default_factory=list)
+
+    def vars(self) -> dict[str, str | None]:
+        return {"multiarch": self.multiarch, "arch": self.arch, "kernel": self.kernel,
+                "home": self.home, "data": self.data, "nvidia_major": self.nvidia_major}
+
+    def gpu_vendors(self) -> set[str]:
+        return {g.vendor for g in self.gpus}
+
+    def gpu_drivers(self) -> set[str]:
+        return {g.driver for g in self.gpus}
+
+
+def normalize_desktop(raw: str, env: dict[str, str]) -> str:
+    """Same mapping as castdeskd's session.rs."""
+    d = raw.lower()
+    if env.get("SWAYSOCK") or "sway" in d:
+        return "sway"
+    if env.get("HYPRLAND_INSTANCE_SIGNATURE") or "hyprland" in d:
+        return "Hyprland"
+    if any(k in d for k in ("gnome", "ubuntu", "pop")):
+        return "GNOME"
+    if "kde" in d or "plasma" in d:
+        return "KDE"
+    return raw.split(":")[0] if raw.strip(":") else "unknown"
+
+
+def detect_session(sys_: System, env: dict[str, str]) -> tuple[str, str, str]:
+    """(session, desktop, source). Env vars first; else ask logind (works over SSH)."""
+    kind = env.get("XDG_SESSION_TYPE", "")
+    if kind not in ("wayland", "x11"):
+        kind = "wayland" if env.get("WAYLAND_DISPLAY") else "x11" if env.get("DISPLAY") else ""
+    if kind:
+        raw = f"{env.get('XDG_CURRENT_DESKTOP', '')}:{env.get('XDG_SESSION_DESKTOP', '')}"
+        return kind, normalize_desktop(raw, env), "env"
+
+    rc, out = sys_.run(["loginctl", "list-sessions", "--no-legend"])
+    if rc != 0:
+        return "unknown", "unknown", "none"
+    user = env.get("SUDO_USER") or getpass.getuser()
+    best = None
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) < 3 or cols[2] != user:
+            continue
+        rc, props = sys_.run(["loginctl", "show-session", cols[0],
+                              "-p", "Type", "-p", "Desktop", "-p", "Class", "-p", "State"])
+        if rc != 0:
+            continue
+        p = dict(l.split("=", 1) for l in props.splitlines() if "=" in l)
+        if p.get("Type") in ("wayland", "x11") and p.get("Class", "user") == "user":
+            score = 1 if p.get("State") == "active" else 0
+            if best is None or score > best[0]:
+                best = (score, p["Type"], p.get("Desktop", ""))
+    if best:
+        return best[1], normalize_desktop(best[2], {}), "loginctl"
+    return "unknown", "unknown", "none"
+
+
+def detect_gpus(sys_: System, sysfs: str = "/sys/class/drm") -> list[Gpu]:
+    gpus = []
+    for card in sys_.glob(f"{sysfs}/card[0-9]*"):
+        if "-" in os.path.basename(card):      # connectors like card0-eDP-1
+            continue
+        vendor_id = (sys_.read(f"{card}/device/vendor") or "").strip()
+        vendor = PCI_VENDORS.get(vendor_id)
+        if not vendor:
+            continue
+        link = sys_.readlink(f"{card}/device/driver") or ""
+        gpus.append(Gpu(card=os.path.basename(card), vendor=vendor, driver=os.path.basename(link)))
+    return gpus
+
+
+def detect_nvidia_major(sys_: System) -> str | None:
+    text = sys_.read("/proc/driver/nvidia/version") or ""
+    m = re.search(r"Kernel Module(?:\s+for\s+\S+)?\s+(\d+)\.\d+", text)
+    if m:
+        return m.group(1)
+    rc, out = sys_.run(["modinfo", "-F", "version", "nvidia"])
+    m = re.match(r"(\d+)\.", out.strip()) if rc == 0 else None
+    return m.group(1) if m else None
+
+
+def detect_env(sys_: System, args) -> Env:
+    env = sys_.environ()
+    e = Env()
+    osr = sys_.read("/etc/os-release") or ""
+    kv = dict(re.findall(r'^(\w+)="?([^"\n]*)"?$', osr, re.M))
+    e.distro, e.distro_version = kv.get("ID", "unknown"), kv.get("VERSION_ID", "")
+    like = f"{kv.get('ID', '')} {kv.get('ID_LIKE', '')}"
+    e.family = ("apt" if re.search(r"\b(debian|ubuntu)\b", like) else
+                "dnf" if re.search(r"\b(fedora|rhel)\b", like) else
+                "pacman" if "arch" in like else None)
+    rc, out = sys_.run(["dpkg-architecture", "-qDEB_HOST_MULTIARCH"])
+    e.multiarch = out.strip() if rc == 0 and out.strip() else {
+        "x86_64": "x86_64-linux-gnu", "aarch64": "aarch64-linux-gnu",
+        "armv7l": "arm-linux-gnueabihf"}.get(e.arch, f"{e.arch}-linux-gnu")
+    e.data = os.path.join(env.get("XDG_DATA_HOME", os.path.join(e.home, ".local/share")), "castdesk")
+
+    if args.session or args.desktop:
+        e.session, e.desktop, e.session_source = args.session or "unknown", args.desktop or "unknown", "override"
+    else:
+        e.session, e.desktop, e.session_source = detect_session(sys_, env)
+
+    e.gpus = detect_gpus(sys_)
+    if args.gpu:
+        e.gpus = [Gpu(card="override", vendor=v, driver={"nvidia": "nvidia", "amd": "amdgpu"}.get(v, "i915"))
+                  for v in args.gpu]
+    if "nvidia" in e.gpu_drivers():
+        e.nvidia_major = detect_nvidia_major(sys_)
+
+    runtime_dir = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    e.user_bus = bool(sys_.glob(f"{runtime_dir}/bus")) or bool(env.get("DBUS_SESSION_BUS_ADDRESS"))
+    e.display = bool(env.get("DISPLAY"))
+    e.root = os.geteuid() == 0
+    e.features = sorted(set(args.with_ or []))
+    return e
+
+
+# ───────────────────────────────────── probes ─────────────────────────────────────
+
+def vtuple(s: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", s)[:3])
+
+
+def fmt(s: str, env: Env) -> str:
+    """Expand {templates}; raises KeyError if a needed value is unknown."""
+    def sub(m):
+        v = env.vars().get(m.group(1))
+        if v is None:
+            raise KeyError(m.group(1))
+        return v
+    return re.sub(r"\{(\w+)\}", sub, s)
+
+
+@dataclass
+class ProbeResult:
+    ok: bool
+    detail: str = ""
+    found: str | None = None
+    unverified: bool = False      # couldn't check from here (no display / session bus)
+
+
+class Prober:
+    def __init__(self, sys_: System, env: Env):
+        self.sys, self.env = sys_, env
+        self.has_gst_inspect = sys_.which("gst-inspect-1.0") is not None
+
+    def probe(self, p: dict) -> ProbeResult:
+        for need in p.get("needs", []):
+            if need == "user-bus" and not self.env.user_bus:
+                return ProbeResult(False, "needs your session D-Bus (run from your desktop session, not SSH/sudo)", unverified=True)
+            if need == "display" and not self.env.display:
+                return ProbeResult(False, "needs $DISPLAY (run from your X11 session)", unverified=True)
+        if "also_binary" in p and not self.sys.which(p["also_binary"]):
+            return ProbeResult(False, f"{p['also_binary']} not found")
+        if "requires_binary" in p and not self.sys.which(p["requires_binary"]):
+            # The probe tool itself is a separate (optional) dep; don't double-report.
+            return ProbeResult(False, f"can't check without {p['requires_binary']}", unverified=True)
+        return getattr(self, "p_" + p["kind"].replace("-", "_"))(p)
+
+    def p_binary(self, p):
+        names = [p["name"], *p.get("also", [])]
+        missing = [n for n in names if not self.sys.which(n)]
+        if missing and p.get("also_any"):
+            alt = next((a for a in p["also_any"] if self.sys.which(a)), None)
+            if alt:
+                return ProbeResult(True, found=self.sys.which(alt))
+        if missing:
+            return ProbeResult(False, f"{', '.join(missing)} not on PATH")
+        return ProbeResult(True, found=self.sys.which(p["name"]))
+
+    def _version_of(self, bin_: str, args: list[str], regex: str) -> str | None:
+        rc, out = self.sys.run([bin_, *args])
+        m = re.search(regex, out, re.M)
+        return m.group(1) if m else None
+
+    def p_version(self, p):
+        tried = []
+        for b in p["bins"]:
+            try:
+                path = self.sys.which(fmt(b, self.env))
+            except KeyError:
+                continue
+            if not path:
+                continue
+            rc, out = self.sys.run([path, *p.get("args", ["--version"])])
+            m = re.search(p["regex"], out, re.M)
+            v = m.group(1) if m else None
+            if v is None:
+                first = out.strip().splitlines()[0][:70] if out.strip() else f"exit {rc}, no output"
+                tried.append(f"{os.path.basename(path)}: {first}")
+                continue
+            if vtuple(v) >= vtuple(p["min"]):
+                return ProbeResult(True, f"{v}", found=path)
+            tried.append(f"{path} is {v}, need >= {p['min']}")
+        return ProbeResult(False, "; ".join(tried) or "not found")
+
+    def toolchain_candidates(self) -> list[str]:
+        c = [self.sys.which("cargo"), f"{self.env.home}/.cargo/bin/cargo",
+             *reversed(self.sys.glob("/usr/lib/rust-*/bin/cargo"))]
+        seen, out = set(), []
+        for x in c:
+            if x and x not in seen and self.sys.which(x):
+                seen.add(x)
+                out.append(x)
+        return out
+
+    def p_toolchain(self, p):
+        best, notes = None, []
+        for cargo in self.toolchain_candidates():
+            v = self._version_of(cargo, ["--version"], r"cargo (\d+\.\d+\.\d+)")
+            if not v:
+                continue
+            rustc = os.path.join(os.path.dirname(cargo), "rustc")
+            if not self.sys.which(rustc) and not self.sys.which("rustc"):
+                notes.append(f"{cargo} has no rustc next to it")
+                continue
+            if vtuple(v) >= vtuple(p["min"]):
+                if best is None or vtuple(v) > vtuple(best[1]):
+                    best = (cargo, v)
+            else:
+                notes.append(f"{cargo} is {v} (too old)")
+        if best:
+            return ProbeResult(True, f"cargo {best[1]}", found=best[0])
+        return ProbeResult(False, "; ".join(notes) or "no cargo found")
+
+    def p_pkgconfig(self, p):
+        if not self.sys.which("pkg-config"):
+            return ProbeResult(False, "pkg-config missing, can't check")
+        rc, out = self.sys.run(["pkg-config", "--modversion", p["module"]])
+        if rc != 0:
+            return ProbeResult(False, f"{p['module']}.pc not found")
+        v = out.strip()
+        if vtuple(v) < vtuple(p.get("min", "0")):
+            return ProbeResult(False, f"{p['module']} {v}, need >= {p['min']}")
+        return ProbeResult(True, v)
+
+    def p_gst_element(self, p):
+        missing = []
+        if self.has_gst_inspect:
+            for el in p["elements"]:
+                rc, _ = self.sys.run(["gst-inspect-1.0", "--exists", el])
+                if rc != 0:
+                    missing.append(el)
+            if missing:
+                return ProbeResult(False, f"element(s) missing: {', '.join(missing)}")
+            return ProbeResult(True)
+        # No gst-inspect: check the plugin files exist (less precise: a plugin
+        # can be present but not register elements, e.g. nvcodec without a driver).
+        plugins = p["plugin"] if isinstance(p["plugin"], list) else [p["plugin"]]
+        for pl in plugins:
+            if not self.sys.glob(f"/usr/lib/{self.env.multiarch}/gstreamer-1.0/libgst{pl}.so"):
+                missing.append(f"libgst{pl}.so")
+        if missing:
+            return ProbeResult(False, f"plugin file(s) missing: {', '.join(missing)}")
+        return ProbeResult(True, "plugin present (install gstreamer1.0-tools for an exact check)")
+
+    def p_file(self, p):
+        try:
+            pat = fmt(p["glob"], self.env)
+        except KeyError as k:
+            return ProbeResult(False, f"unknown {k.args[0]}")
+        hits = self.sys.glob(pat)
+        return ProbeResult(True, found=hits[0]) if hits else ProbeResult(False, f"{pat} not found")
+
+    def p_dbus_name(self, p):
+        rc, out = self.sys.run(["busctl", "--user", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                "org.freedesktop.DBus", "NameHasOwner", "s", p["name"]])
+        if rc != 0:
+            return ProbeResult(False, f"session bus not reachable: {out.strip()[:80]}", unverified=True)
+        return ProbeResult(True) if "true" in out else ProbeResult(False, f"{p['name']} not on the session bus")
+
+    def p_command(self, p):
+        rc, out = self.sys.run(p["cmd"])
+        if rc != 0:
+            return ProbeResult(False, f"`{' '.join(p['cmd'])}` failed: {out.strip().splitlines()[-1][:100] if out.strip() else rc}")
+        if p.get("regex") and not re.search(p["regex"], out, re.M):
+            return ProbeResult(False, "capability not reported")
+        return ProbeResult(True)
+
+    def p_access(self, p):
+        nodes = self.sys.glob(p["glob"])
+        if not nodes:
+            return ProbeResult(False, f"no {p['glob']}")
+        bad = [n for n in nodes if not self.sys.access_rw(n)]
+        return ProbeResult(False, f"no read/write access to {', '.join(bad)}") if bad else ProbeResult(True, found=nodes[0])
+
+    def p_kmod(self, p):
+        if self.sys.glob(f"/sys/module/{p['name']}"):
+            return ProbeResult(True, "loaded")
+        rc, _ = self.sys.run(["modinfo", "-F", "version", p["name"]])
+        return ProbeResult(True, "installed, not loaded") if rc == 0 else ProbeResult(False, "module not installed")
+
+
+# ───────────────────────────── package resolution ─────────────────────────────
+
+class Apt:
+    def __init__(self, sys_: System):
+        self.sys = sys_
+        self._avail: dict[str, bool] = {}
+
+    def installed(self, pkg: str) -> bool:
+        rc, out = self.sys.run(["dpkg-query", "-W", "-f=${db:Status-Status}", pkg])
+        return rc == 0 and out.strip() == "installed"
+
+    def available(self, pkg: str) -> bool:
+        if pkg not in self._avail:
+            rc, out = self.sys.run(["apt-cache", "policy", pkg])
+            m = re.search(r"Candidate:\s*(\S+)", out)
+            self._avail[pkg] = rc == 0 and bool(m) and m.group(1) != "(none)"
+        return self._avail[pkg]
+
+    def candidate_version(self, pkg: str) -> str | None:
+        rc, out = self.sys.run(["apt-cache", "policy", pkg])
+        m = re.search(r"Candidate:\s*(\S+)", out)
+        return m.group(1) if rc == 0 and m and m.group(1) != "(none)" else None
+
+    def pkgnames(self, prefix: str) -> list[str]:
+        rc, out = self.sys.run(["apt-cache", "pkgnames", prefix])
+        return out.split() if rc == 0 else []
+
+    def lists_age_days(self) -> float | None:
+        stamps = self.sys.glob("/var/lib/apt/lists/*_InRelease")
+        if not stamps:
+            return None
+        return (time.time() - max(os.path.getmtime(s) for s in stamps)) / 86400
+
+
+@dataclass
+class Resolution:
+    packages: list[str] = field(default_factory=list)   # to install
+    installed_but_failing: list[str] = field(default_factory=list)
+    unavailable: list[str] = field(default_factory=list)
+    note: str = ""
+
+
+def resolve_apt(dep: dict, env: Env, apt: Apt) -> Resolution:
+    spec = dep.get("apt")
+    r = Resolution()
+    if spec is None:
+        return r
+    if isinstance(spec, dict) and "versioned" in spec:  # newest versioned package >= min, e.g. cargo-1.91
+        pat = spec["versioned"]
+        prefix = pat.split("{")[0]
+        rx = re.compile("^" + re.escape(prefix) + r"(\d+)$")
+        min_minor = vtuple(spec["min"])[1]
+        minors = sorted((int(m.group(1)) for n in apt.pkgnames(prefix) if (m := rx.match(n))), reverse=True)
+        for minor in minors:
+            if minor < min_minor:
+                break
+            names = [x.replace("{minor}", str(minor)) for x in [pat, *spec.get("also", [])]]
+            if all(apt.available(n) for n in names):
+                if all(apt.installed(n) for n in names):
+                    r.installed_but_failing = names
+                else:
+                    r.packages = names
+                return r
+        r.unavailable = [pat.replace("{minor}", f">={min_minor}")]
+        return r
+    min_version = None
+    if isinstance(spec, dict) and "pkg" in spec:   # { pkg = "x", min = "6.0" }
+        min_version, spec = spec.get("min"), spec["pkg"]
+    candidates = [spec] if isinstance(spec, str) else list(spec)
+    try:
+        candidates = [fmt(c, env) for c in candidates]
+    except KeyError as k:
+        r.note = f"can't pick a package until {k.args[0]} is known"
+        return r
+    for c in candidates:
+        if apt.installed(c):
+            r.installed_but_failing = [c]
+            return r
+    for i, c in enumerate(candidates):
+        if apt.available(c) and min_version:
+            cand = apt.candidate_version(c) or "0"
+            if vtuple(re.sub(r"^\d+:", "", cand)) < vtuple(min_version):
+                r.unavailable = [f"{c} >= {min_version} (your apt sources offer {cand})"]
+                return r
+        if apt.available(c):
+            r.packages = [c]
+            if i > 0:
+                r.note = f"{', '.join(candidates[:i])} not available from your apt sources; using {c}"
+            return r
+    r.unavailable = candidates
+    return r
+
+
+# ───────────────────────────────────── checking ─────────────────────────────────────
+
+@dataclass
+class Result:
+    id: str
+    phase: str
+    level: str
+    what: str
+    status: str                  # ok | missing | unverified | skipped
+    detail: str = ""
+    found: str | None = None
+    packages: list[str] = field(default_factory=list)
+    installed_but_failing: list[str] = field(default_factory=list)
+    unavailable: list[str] = field(default_factory=list)
+    provider: str | None = None
+    hint: str = ""
+    after: str = ""
+    note: str = ""
+    why: str = ""
+
+
+def applies(dep: dict, env: Env) -> tuple[bool, str]:
+    feats = dep.get("features")
+    if feats and not set(feats) & set(env.features):
+        return False, f"feature {'/'.join(feats)} not requested"
+    when = dep.get("when", {})
+    checks = {
+        "session": {env.session}, "desktop": {env.desktop},
+        "gpu": env.gpu_vendors(), "gpu_driver": env.gpu_drivers(),
+    }
+    for key, values in when.items():
+        if not checks[key] & set(values):
+            return False, f"{key} is not {'/'.join(values)}"
+    return True, ""
+
+
+def load_manifest(path: Path) -> list[dict]:
+    data = tomllib.loads(path.read_text())
+    deps = data.get("dep", [])
+    errors, seen = [], set()
+    for d in deps:
+        i = d.get("id", "?")
+        if i in seen:
+            errors.append(f"duplicate id {i}")
+        seen.add(i)
+        if d.get("phase") not in PHASES:
+            errors.append(f"{i}: bad phase {d.get('phase')}")
+        if d.get("level") not in LEVELS:
+            errors.append(f"{i}: bad level {d.get('level')}")
+        if d.get("probe", {}).get("kind") not in PROBE_KINDS:
+            errors.append(f"{i}: bad probe kind {d.get('probe', {}).get('kind')}")
+        if "apt" not in d and "provider" not in d:
+            errors.append(f"{i}: needs `apt` or `provider`")
+        if set(d.get("when", {})) - WHEN_KEYS:
+            errors.append(f"{i}: unknown when keys {set(d['when']) - WHEN_KEYS}")
+    if errors:
+        raise ValueError("deps.toml: " + "; ".join(errors))
+    return deps
+
+
+def check(deps: list[dict], env: Env, sys_: System, phases: set[str]) -> list[Result]:
+    prober = Prober(sys_, env)
+    apt = Apt(sys_) if env.family == "apt" else None
+    out = []
+    for d in deps:
+        if d["phase"] not in phases:
+            continue
+        r = Result(id=d["id"], phase=d["phase"], level=d["level"], what=d["what"], status="ok",
+                   provider=d.get("provider"), hint=d.get("hint", ""), after=d.get("after", ""),
+                   why=d.get("why", ""))
+        ok, reason = applies(d, env)
+        if not ok:
+            # Unknown session means we can't rule session-specific deps out.
+            # Unknown session: session-wide deps can't be ruled out, but
+            # desktop-specific ones would just be noise.
+            w = d.get("when", {})
+            unknown = env.session == "unknown" and "session" in w and "desktop" not in w
+            r.status, r.detail = ("unverified", "session unknown: rerun inside your desktop session or pass --session/--desktop") if unknown else ("skipped", reason)
+            out.append(r)
+            continue
+        pr = prober.probe(d["probe"])
+        r.detail, r.found = pr.detail, pr.found
+        if pr.ok:
+            r.status = "ok"
+        elif pr.unverified:
+            r.status = "unverified"
+        else:
+            r.status = "missing"
+            if apt:
+                res = resolve_apt(d, env, apt)
+                r.packages, r.installed_but_failing = res.packages, res.installed_but_failing
+                r.unavailable, r.note = res.unavailable, res.note
+        out.append(r)
+    return out
+
+
+# ───────────────────────────────────── output ─────────────────────────────────────
+
+C = {"ok": "\033[32m✔\033[0m", "missing": "\033[31m✘\033[0m", "unverified": "\033[33m?\033[0m",
+     "skipped": "\033[2m·\033[0m"}
+
+
+def describe_env(e: Env) -> str:
+    gpus = ", ".join(f"{g.vendor} ({g.driver or 'no driver'})" for g in e.gpus) or "none detected"
+    nv = f", NVIDIA driver {e.nvidia_major}" if e.nvidia_major else ""
+    return (f"{e.distro} {e.distro_version} ({e.arch}) · session {e.session}/{e.desktop} "
+            f"[{e.session_source}] · GPU {gpus}{nv}")
+
+
+def plan(results: list[Result], levels: set[str]) -> tuple[list[str], list[Result]]:
+    pkgs, manual = [], []
+    for r in results:
+        if r.status != "missing" or r.level not in levels:
+            continue
+        if r.packages:
+            pkgs += [p for p in r.packages if p not in pkgs]
+        elif not r.installed_but_failing:
+            manual.append(r)
+    return pkgs, manual
+
+
+def print_human(results: list[Result], env: Env, verbose: bool, levels: set[str]):
+    tty = sys.stdout.isatty()
+    sym = C if tty else {"ok": "ok ", "missing": "MISSING", "unverified": "?  ", "skipped": "-  "}
+    print(f"CastDesk dependency check: {describe_env(env)}")
+    if env.root:
+        print("  note: running as root; session, D-Bus and render-node checks reflect root, not you. Run without sudo.")
+    for phase in PHASES:
+        rows = [r for r in results if r.phase == phase and (verbose or r.status != "skipped")]
+        if not rows:
+            continue
+        print(f"\n{phase}")
+        for r in rows:
+            right = r.found or r.detail if r.status == "ok" else r.detail
+            line = f"  {sym[r.status]} {r.id:<20} {r.what}"
+            if r.level != "required":
+                line += f"  [{r.level}]"
+            print(line)
+            if right and (r.status != "ok" or verbose):
+                print(f"      {right}")
+            if r.status == "missing":
+                if r.packages:
+                    print(f"      → apt: {' '.join(r.packages)}")
+                if r.installed_but_failing:
+                    print(f"      → {' '.join(r.installed_but_failing)} already installed, but the check still fails"
+                          + (f": {r.after}" if r.after else " (re-login / reboot?)"))
+                if r.unavailable:
+                    print(f"      → not available from your apt sources: {' '.join(r.unavailable)}")
+                if r.note:
+                    print(f"      note: {r.note}")
+                if r.hint and not r.packages:
+                    print(f"      hint: {r.hint}")
+    req = [r for r in results if r.status == "missing" and r.level == "required"]
+    rec = [r for r in results if r.status == "missing" and r.level == "recommended"]
+    unv = [r for r in results if r.status == "unverified"]
+    print(f"\nmissing: {len(req)} required, {len(rec)} recommended · unverified: {len(unv)}")
+    pkgs, manual = plan(results, levels)
+    if pkgs:
+        print(f"install with:  sudo apt-get install {' '.join(pkgs)}")
+    for r in manual:
+        print(f"manual step ({r.id}): {r.hint or r.detail}")
+    for r in results:
+        if r.status == "missing" and r.packages and r.after and r.level in levels:
+            print(f"after installing {r.id}: {r.after}")
+
+
+def do_install(pkgs: list[str], apt: Apt, yes: bool) -> int:
+    sudo = [] if os.geteuid() == 0 else ["sudo"]
+    print(f"\nWill run: {' '.join(sudo + ['apt-get', 'install', '-y', *pkgs])}")
+    if not yes:
+        if not sys.stdin.isatty():
+            print("not a terminal; pass --yes to install non-interactively")
+            return 1
+        if input("Proceed? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+            return 1
+    age = apt.lists_age_days()
+    if age is None or age > 1:
+        subprocess.run(sudo + ["apt-get", "update"], check=False)
+    return subprocess.run(sudo + ["apt-get", "install", "-y", *pkgs]).returncode
+
+
+# ───────────────────────────────────── main ─────────────────────────────────────
+
+def find_manifest(arg: str | None) -> Path:
+    here = Path(__file__).resolve().parent
+    for p in [arg, os.environ.get("CASTDESK_DEPS_MANIFEST"), here / "deps.toml",
+              Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "castdesk/deps.toml"]:
+        if p and Path(p).is_file():
+            return Path(p)
+    sys.exit("deps.toml not found (pass --manifest)")
+
+
+def main(argv=None, sys_: System | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", nargs="?", default="check", choices=["check", "env", "which"])
+    ap.add_argument("target", nargs="?", help="dep id for `which`")
+    ap.add_argument("--manifest")
+    ap.add_argument("--phase", default="build,install,runtime", help="comma list of build,install,runtime")
+    ap.add_argument("--with", dest="with_", action="append", metavar="FEATURE", help="optional feature (evdi)")
+    ap.add_argument("--session", choices=["wayland", "x11"], help="override session detection")
+    ap.add_argument("--desktop", help="override desktop detection (GNOME, KDE, sway, Hyprland, ...)")
+    ap.add_argument("--gpu", action="append", choices=["intel", "amd", "nvidia"], help="override GPU detection")
+    ap.add_argument("--install", action="store_true", help="apt-get install missing required+recommended packages")
+    ap.add_argument("--optional", action="store_true", help="also install optional packages")
+    ap.add_argument("--yes", "-y", action="store_true", help="don't ask before installing")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--verbose", "-v", action="store_true", help="show skipped deps and details")
+    args = ap.parse_args(argv)
+
+    sys_ = sys_ or System()
+    try:
+        deps = load_manifest(find_manifest(args.manifest))
+    except (ValueError, tomllib.TOMLDecodeError) as e:
+        print(e, file=sys.stderr)
+        return 2
+    env = detect_env(sys_, args)
+
+    if args.command == "env":
+        print(json.dumps(asdict(env), indent=2) if args.json else describe_env(env))
+        return 0
+    if args.command == "which":
+        dep = next((d for d in deps if d["id"] == args.target), None)
+        if not dep:
+            print(f"unknown dep {args.target}", file=sys.stderr)
+            return 2
+        pr = Prober(sys_, env).probe(dep["probe"])
+        if pr.ok and pr.found:
+            print(pr.found)
+            return 0
+        print(pr.detail, file=sys.stderr)
+        return 1
+
+    phases = {p.strip() for p in args.phase.split(",")}
+    if phases - set(PHASES):
+        print(f"bad --phase {args.phase}", file=sys.stderr)
+        return 2
+    levels = {"required", "recommended"} | ({"optional"} if args.optional else set())
+    results = check(deps, env, sys_, phases)
+
+    if args.install:
+        pkgs, _ = plan(results, levels)
+        if pkgs and env.family == "apt":
+            print_human(results, env, args.verbose, levels)
+            rc = do_install(pkgs, Apt(sys_), args.yes)
+            if rc != 0:
+                return 1
+            results = check(deps, env, sys_, phases)   # re-probe after installing
+            print("\nafter install:")
+        elif pkgs:
+            print(f"automatic install supports apt only ({env.distro}); install equivalents of: {' '.join(pkgs)}")
+
+    if args.json:
+        pkgs, manual = plan(results, levels)
+        print(json.dumps({"env": asdict(env), "results": [asdict(r) for r in results],
+                          "plan": {"apt": pkgs, "manual": [r.id for r in manual]}}, indent=2))
+    else:
+        print_human(results, env, args.verbose, levels)
+    return 1 if any(r.status == "missing" and r.level == "required" for r in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

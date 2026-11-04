@@ -36,13 +36,11 @@ async fn main() -> Result<()> {
                 app.apply(u);
             }
             terminal.draw(|f| ui::draw(f, &app))?;
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press {
+            if event::poll(Duration::from_millis(100))?
+                && let Event::Key(k) = event::read()?
+                    && k.kind == KeyEventKind::Press {
                         app.on_key(k);
                     }
-                }
-            }
             if app.quit {
                 return Ok(());
             }

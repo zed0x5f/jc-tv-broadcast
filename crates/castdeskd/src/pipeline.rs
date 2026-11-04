@@ -190,6 +190,55 @@ mod tests {
         assert!(s.contains("startx=1920 starty=0 endx=3199 endy=719"));
     }
 
+    /// Every element a pipeline can contain must be declared in
+    /// packaging/deps.toml, so the installer knows to provide it.
+    #[test]
+    fn all_elements_declared_in_deps_manifest() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../../packaging/deps.toml")).expect("deps.toml parses");
+        let mut declared = std::collections::BTreeSet::new();
+        for dep in manifest["dep"].as_array().unwrap() {
+            let probe = &dep["probe"];
+            if probe["kind"].as_str() == Some("gst-element") {
+                for key in ["elements", "covers"] {
+                    if let Some(list) = probe.get(key).and_then(|v| v.as_array()) {
+                        declared.extend(list.iter().map(|e| e.as_str().unwrap().to_string()));
+                    }
+                }
+            }
+        }
+
+        let mut used = std::collections::BTreeSet::new();
+        let sources = [
+            CaptureSource::PipeWire { fd: None, node_id: 1, drives_size: true },
+            CaptureSource::X11 { display: ":0".into(), x: 0, y: 0, width: 640, height: 360 },
+            CaptureSource::Test,
+        ];
+        for cand in encoder::CANDIDATES {
+            used.insert(cand.element.to_string());
+            let v = VideoSettings { codec: cand.codec, ..Default::default() };
+            for src in &sources {
+                let p = PipelineParams {
+                    video: &v,
+                    encoder: cand.element,
+                    source: src,
+                    rtsp_publish: "rtsp://127.0.0.1:1/x".into(),
+                };
+                for segment in description(&p, true).split('!') {
+                    let el = segment.split_whitespace().next().unwrap_or_default();
+                    if !el.is_empty() && !el.contains('/') && !el.ends_with('.') {
+                        used.insert(el.to_string());
+                    }
+                }
+            }
+        }
+        // Elements rtspclientsink loads internally, and the encoder probe's.
+        used.extend(["rtph264pay", "rtph265pay", "rtpbin", "capsfilter", "fakesink"].map(String::from));
+
+        let missing: Vec<_> = used.difference(&declared).collect();
+        assert!(missing.is_empty(), "add these to packaging/deps.toml: {missing:?}");
+    }
+
     #[test]
     fn full_description_parses() {
         gst::init().unwrap();

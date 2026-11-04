@@ -90,6 +90,7 @@ async fn main() -> Result<()> {
         let mtx = mediamtx::locate(&cfg.mediamtx);
         println!("mediamtx: {}", mtx.map(|p| p.display().to_string()).unwrap_or("NOT FOUND".into()));
         println!("lan ip:   {}", lan_ip().map(|i| i.to_string()).unwrap_or("?".into()));
+        println!("\nfor missing pieces → packages, run: castdesk-deps");
         return Ok(());
     }
 

@@ -73,20 +73,33 @@ around it.
 
 ```bash
 git clone https://github.com/zed0x5f/jc-tv-broadcast && cd jc-tv-broadcast
-packaging/install.sh --deps        # --deps uses sudo for distro packages; omit if you have them
+packaging/install.sh               # run from your desktop session, as your user (not sudo)
 systemctl --user start castdeskd
 castdesk-tui
 ```
 
-`install.sh` builds release binaries into `~/.local/bin`, downloads
-**MediaMTX v1.21.3** into `~/.local/share/castdesk/bin/` (verified against the
-release's `checksums.sha256`), and installs and enables the
-`castdeskd.service` user unit plus a desktop entry. Nothing else needs root.
-Requirements: Rust ≥ 1.85, GStreamer ≥ 1.22, MediaMTX ≥ 1.12.
+Dependencies are **detected at install time, on your machine**. The
+installer detects your session (Wayland/X11, GNOME/KDE/Sway), GPU and
+driver. It probes everything that applies, maps what's missing to packages
+your apt sources actually offer, shows the `sudo apt-get install …` line and
+asks first, then re-probes. Then it builds with whichever Rust toolchain
+qualifies (Ubuntu 24.04's apt `cargo-1.91` works; rustup isn't needed),
+downloads **MediaMTX v1.21.3** (pinned, sha256-verified) into
+`~/.local/share/castdesk/bin/`, and installs the `castdeskd.service` user unit
+and a desktop entry. sudo is used only for apt.
+See [docs/dependencies.md](docs/dependencies.md) for how it works.
 
-`castdeskd doctor` prints the detected session, the backend order, which
-encoders actually work (each is probed with a real 5-frame encode), and any
-missing GStreamer elements.
+```bash
+packaging/install.sh --check-only  # just report what's missing
+packaging/install.sh --yes         # no prompts
+packaging/install.sh --with-evdi   # include the optional evdi kernel module
+castdesk-deps                      # re-check later (new GPU/driver/desktop); -v shows skipped items
+castdesk-deps --session x11 --gpu nvidia   # check for a different setup, e.g. over SSH
+```
+
+Minimums: Rust 1.91, GStreamer 1.22, MediaMTX 1.12, Python 3.11 (for the
+checker). `castdeskd doctor` complements it with real 5-frame test encodes on
+every encoder.
 
 Config lives in `~/.config/castdesk/config.toml`. Displays you add in the TUI
 are saved there and recreated on every daemon start:
@@ -220,12 +233,15 @@ destination in stage (b).
 crates/castdesk-core   config, API types, HTTP client (shared by daemon + all UIs)
 crates/castdeskd       daemon: session detection, display backends, encoders, pipelines, MediaMTX, API
 crates/castdesk-tui    ratatui front end
-packaging/             install.sh, systemd user unit, .desktop file
+packaging/             install.sh, deps.toml + castdesk-deps (runtime dependency detection),
+                       systemd user unit, .desktop file
+docs/                  dependencies.md
 scripts/               selftest-stage-a.sh (headless end-to-end check)
 ```
 
-Development: `cargo test --workspace` (29 tests; the GStreamer ones need
-x264enc/rtspclientsink installed), `cargo clippy --workspace --all-targets`.
+Development: `cargo test --workspace` (30 tests; the GStreamer ones need
+x264enc/rtspclientsink installed), `python3 -m unittest discover -s packaging/tests`
+(19 tests), `cargo clippy --workspace --all-targets`.
 
 ### Control API (localhost)
 

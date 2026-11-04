@@ -1,0 +1,506 @@
+# CastDesk dependency manifest: the single source of truth for what CastDesk
+# needs. `packaging/castdesk-deps` reads it at install time (and any time
+# later) to probe this machine and turn whatever is missing into packages.
+#
+# Each [[dep]] has:
+#   id      unique name
+#   phase   build | install | runtime
+#   level   required | recommended | optional
+#           (optional entries are checked but never installed unless asked)
+#   what    one-line description shown to the user
+#   why     what breaks without it
+#   when    conditions; all keys must match (AND), any value in a list (OR):
+#             session    = ["wayland", "x11"]          detected session type
+#             desktop    = ["GNOME", "KDE", "sway", "Hyprland", ...]
+#             gpu        = ["intel", "amd", "nvidia"]   any GPU present of that vendor
+#             gpu_driver = ["nvidia", "nouveau", "i915", "xe", "amdgpu"]
+#   features  only checked when requested: castdesk-deps --with evdi
+#   probe   how to tell it's present (see `kind` list in castdesk-deps)
+#   apt     Ubuntu/Debian package(s):
+#             "pkg"                 one package
+#             ["a", "b"]            first one apt can install wins
+#             { versioned = "cargo-1.{minor}", also = [...], min = "1.91" }
+#                                   newest versioned package >= min
+#           Templates: {multiarch} {arch} {kernel} {nvidia_major} {home} {data}
+#   provider  "download" | "driver" | "manual" for things apt can't supply
+#   hint    what to tell the user (shown when missing)
+#   after   what to do after installing (re-login, reboot, …)
+#
+# Keep in sync with the code: `cargo test -p castdeskd` fails if the pipeline
+# uses a GStreamer element missing here, and packaging/tests fail if the Rust
+# code runs an external command missing here.
+
+schema = 1
+
+# ───────────────────────────── build ─────────────────────────────
+
+[[dep]]
+id = "rust"
+phase = "build"
+level = "required"
+what = "Rust toolchain (cargo + rustc) >= 1.91"
+why = "compiles castdeskd and castdesk-tui (Cargo.toml rust-version)"
+probe = { kind = "toolchain", min = "1.91" }
+# Ubuntu 24.04's plain `cargo` is 1.75; noble-updates ships versioned
+# toolchains (cargo-1.85 … cargo-1.91) installed under /usr/lib/rust-1.N/bin.
+apt = { versioned = "cargo-1.{minor}", also = ["rustc-1.{minor}"], min = "1.91" }
+hint = "or use rustup: curl --proto '=https' -sSf https://sh.rustup.rs | sh"
+
+[[dep]]
+id = "cc"
+phase = "build"
+level = "required"
+what = "C compiler + linker"
+why = "Rust links native code (and *-sys crates) with cc"
+probe = { kind = "binary", name = "cc" }
+apt = "build-essential"
+
+[[dep]]
+id = "pkg-config"
+phase = "build"
+level = "required"
+what = "pkg-config"
+why = "gstreamer-sys/glib-sys locate the C libraries with it"
+probe = { kind = "binary", name = "pkg-config" }
+apt = ["pkgconf", "pkg-config"]
+
+[[dep]]
+id = "glib-dev"
+phase = "build"
+level = "required"
+what = "GLib/GObject development files"
+why = "glib-sys and gobject-sys bindings"
+probe = { kind = "pkgconfig", module = "gobject-2.0", min = "2.70" }
+apt = "libglib2.0-dev"
+
+[[dep]]
+id = "gstreamer-dev"
+phase = "build"
+level = "required"
+what = "GStreamer >= 1.22 development files"
+why = "gstreamer-rs is built with the v1_22 feature"
+probe = { kind = "pkgconfig", module = "gstreamer-1.0", min = "1.22" }
+apt = "libgstreamer1.0-dev"
+
+# ──────────────────────────── install ────────────────────────────
+
+[[dep]]
+id = "curl"
+phase = "install"
+level = "required"
+what = "curl"
+why = "install.sh downloads MediaMTX"
+probe = { kind = "binary", name = "curl" }
+apt = "curl"
+
+[[dep]]
+id = "tar"
+phase = "install"
+level = "required"
+what = "tar + sha256sum"
+why = "unpack and verify the MediaMTX release"
+probe = { kind = "binary", name = "sha256sum" }
+apt = "coreutils"
+
+# ──────────────────────── runtime: always ────────────────────────
+
+[[dep]]
+id = "libgstreamer"
+phase = "runtime"
+level = "required"
+what = "GStreamer core library"
+why = "every pipeline"
+probe = { kind = "file", glob = "/usr/lib/{multiarch}/libgstreamer-1.0.so.0" }
+apt = "libgstreamer1.0-0"
+
+[[dep]]
+id = "gst-tools"
+phase = "runtime"
+level = "recommended"
+what = "gst-inspect-1.0"
+why = "precise element checks and debugging (castdesk-deps falls back to plugin files without it)"
+probe = { kind = "version", bins = ["gst-inspect-1.0"], args = ["--version"], regex = 'GStreamer (\d+\.\d+\.\d+)', min = "1.22.0" }
+apt = "gstreamer1.0-tools"
+
+[[dep]]
+id = "gst-core-elements"
+phase = "runtime"
+level = "required"
+what = "core elements (queue, tee, identity, capsfilter, fakesink)"
+why = "pipeline plumbing and the encoder self-test"
+probe = { kind = "gst-element", elements = ["queue", "tee", "identity", "capsfilter", "fakesink"], plugin = "coreelements" }
+apt = "libgstreamer1.0-0"
+
+[[dep]]
+id = "gst-base"
+phase = "runtime"
+level = "required"
+what = "videoconvert, videoscale, videotestsrc"
+why = "colour conversion/scaling before the encoder; test backend"
+probe = { kind = "gst-element", elements = ["videoconvert", "videoscale", "videotestsrc"], plugin = "videoconvertscale" }
+apt = "gstreamer1.0-plugins-base"
+
+[[dep]]
+id = "gst-pango"
+phase = "runtime"
+level = "required"
+what = "timeoverlay / textoverlay (pango)"
+why = "test pattern clock and the latency-test overlay"
+probe = { kind = "gst-element", elements = ["timeoverlay"], plugin = "pango" }
+apt = "gstreamer1.0-x"
+
+[[dep]]
+id = "gst-parsers"
+phase = "runtime"
+level = "required"
+what = "h264parse, h265parse"
+why = "inserts SPS/PPS on every keyframe so receivers can join mid-stream"
+probe = { kind = "gst-element", elements = ["h264parse", "h265parse"], plugin = "videoparsersbad" }
+apt = "gstreamer1.0-plugins-bad"
+
+[[dep]]
+id = "gst-rtspclientsink"
+phase = "runtime"
+level = "required"
+what = "rtspclientsink"
+why = "publishes each display to MediaMTX"
+probe = { kind = "gst-element", elements = ["rtspclientsink"], plugin = "rtspclientsink" }
+apt = "gstreamer1.0-rtsp"
+
+[[dep]]
+id = "gst-rtp"
+phase = "runtime"
+level = "required"
+what = "RTP payloaders, rtpbin, UDP elements"
+why = "rtspclientsink loads these internally; stage (b) UDP output"
+probe = { kind = "gst-element", elements = ["rtph264pay", "rtph265pay", "rtpbin", "udpsink", "udpsrc"], plugin = ["rtp", "rtpmanager", "udp"] }
+apt = "gstreamer1.0-plugins-good"
+
+[[dep]]
+id = "x264"
+phase = "runtime"
+level = "required"
+what = "x264enc (software H.264)"
+why = "fallback encoder when no VA-API/NVENC works; always keep one working encoder"
+probe = { kind = "gst-element", elements = ["x264enc"], plugin = "x264" }
+apt = "gstreamer1.0-plugins-ugly"
+
+[[dep]]
+id = "x265"
+phase = "runtime"
+level = "optional"
+what = "x265enc (software H.265)"
+why = "H.265 without a hardware encoder (CPU-heavy)"
+probe = { kind = "gst-element", elements = ["x265enc"], plugin = "x265" }
+apt = "gstreamer1.0-plugins-bad"
+
+[[dep]]
+id = "mediamtx"
+phase = "runtime"
+level = "required"
+what = "MediaMTX >= 1.12"
+why = "RTSP server that receivers connect to"
+probe = { kind = "version", bins = ["{data}/bin/mediamtx", "mediamtx"], args = ["--version"], regex = 'v?(\d+\.\d+\.\d+)', min = "1.12.0" }
+provider = "download"
+hint = "packaging/install.sh downloads the pinned, checksum-verified release into ~/.local/share/castdesk/bin"
+
+[[dep]]
+id = "systemd-user"
+phase = "runtime"
+level = "recommended"
+what = "systemctl / journalctl"
+why = "runs castdeskd as a user service; TUI start/stop and log view"
+probe = { kind = "binary", name = "systemctl", also = ["journalctl"] }
+apt = "systemd"
+
+[[dep]]
+id = "procps"
+phase = "runtime"
+level = "recommended"
+what = "pkill"
+why = "TUI stops a non-systemd daemon; self-test"
+probe = { kind = "binary", name = "pkill" }
+apt = "procps"
+
+[[dep]]
+id = "ffmpeg"
+phase = "runtime"
+level = "optional"
+what = "ffmpeg / ffprobe / ffplay"
+why = "scripts/selftest-stage-a.sh and local playback tests"
+probe = { kind = "binary", name = "ffprobe" }
+apt = "ffmpeg"
+
+# ───────────────────────── runtime: Wayland ──────────────────────
+
+[[dep]]
+id = "gst-pipewire"
+phase = "runtime"
+level = "required"
+when = { session = ["wayland"] }
+what = "pipewiresrc"
+why = "Wayland screen capture"
+probe = { kind = "gst-element", elements = ["pipewiresrc"], plugin = "pipewire" }
+apt = "gstreamer1.0-pipewire"
+
+[[dep]]
+id = "pipewire-running"
+phase = "runtime"
+level = "required"
+when = { session = ["wayland"] }
+what = "PipeWire + WirePlumber running for this user"
+why = "screencast streams are PipeWire nodes"
+probe = { kind = "command", cmd = ["systemctl", "--user", "is-active", "pipewire.service"], needs = ["user-bus"] }
+apt = ["pipewire", "wireplumber"]
+after = "systemctl --user enable --now pipewire.socket wireplumber.service"
+
+[[dep]]
+id = "portal"
+phase = "runtime"
+level = "required"
+when = { session = ["wayland"] }
+what = "xdg-desktop-portal"
+why = "ScreenCast portal (KDE, Sway, GNOME fallback)"
+probe = { kind = "file", glob = "/usr/share/dbus-1/services/org.freedesktop.portal.Desktop.service" }
+apt = "xdg-desktop-portal"
+
+[[dep]]
+id = "portal-gnome"
+phase = "runtime"
+level = "recommended"
+when = { session = ["wayland"], desktop = ["GNOME"] }
+what = "GNOME portal backend"
+why = "fallback when Mutter's private ScreenCast API is denied"
+probe = { kind = "file", glob = "/usr/share/xdg-desktop-portal/portals/gnome.portal" }
+apt = "xdg-desktop-portal-gnome"
+
+[[dep]]
+id = "mutter-screencast"
+phase = "runtime"
+level = "recommended"
+when = { session = ["wayland"], desktop = ["GNOME"] }
+what = "org.gnome.Mutter.ScreenCast on the session bus"
+why = "the dialog-free GNOME virtual monitor backend"
+probe = { kind = "dbus-name", name = "org.gnome.Mutter.ScreenCast", needs = ["user-bus"] }
+provider = "manual"
+hint = "provided by gnome-shell itself; if absent you are not in a GNOME Wayland session (castdeskd will use the portal)"
+
+[[dep]]
+id = "portal-kde"
+phase = "runtime"
+level = "required"
+when = { session = ["wayland"], desktop = ["KDE"] }
+what = "KDE portal backend, Plasma 6 (VIRTUAL source type)"
+why = "virtual monitors on KDE need xdg-desktop-portal-kde >= 6"
+probe = { kind = "version", bins = ["dpkg-query"], args = ["-W", "-f=${Version}", "xdg-desktop-portal-kde"], regex = '^(?:\d+:)?(\d+\.\d+)', min = "6.0" }
+apt = { pkg = "xdg-desktop-portal-kde", min = "6.0" }
+hint = "Kubuntu 24.04 ships Plasma 5.27, which can't create virtual monitors. Use Kubuntu 25.04+ (Plasma 6), or log into a Plasma X11 session (x11 backend)"
+
+[[dep]]
+id = "sway"
+phase = "runtime"
+level = "required"
+when = { session = ["wayland"], desktop = ["sway"] }
+what = "swaymsg"
+why = "creates headless outputs"
+probe = { kind = "binary", name = "swaymsg" }
+apt = "sway"
+
+[[dep]]
+id = "portal-wlr"
+phase = "runtime"
+level = "required"
+when = { session = ["wayland"], desktop = ["sway"] }
+what = "xdg-desktop-portal-wlr"
+why = "captures the headless output on Sway"
+probe = { kind = "file", glob = "/usr/share/xdg-desktop-portal/portals/wlr.portal" }
+apt = "xdg-desktop-portal-wlr"
+
+[[dep]]
+id = "hyprland"
+phase = "runtime"
+level = "required"
+when = { session = ["wayland"], desktop = ["Hyprland"] }
+what = "hyprctl + xdg-desktop-portal-hyprland"
+why = "creates and captures headless outputs on Hyprland"
+probe = { kind = "file", glob = "/usr/share/xdg-desktop-portal/portals/hyprland.portal", also_binary = "hyprctl" }
+provider = "manual"
+hint = "Hyprland and its portal are not in the Ubuntu 24.04 archive; install them from the same source as Hyprland itself"
+
+[[dep]]
+id = "wl-clipboard"
+phase = "runtime"
+level = "optional"
+when = { session = ["wayland"] }
+what = "wl-copy"
+why = "TUI 'copy URL' on Wayland (OSC 52 is the fallback)"
+probe = { kind = "binary", name = "wl-copy" }
+apt = "wl-clipboard"
+
+# ─────────────────────────── runtime: X11 ────────────────────────
+
+[[dep]]
+id = "xrandr"
+phase = "runtime"
+level = "required"
+when = { session = ["x11"] }
+what = "xrandr with RandR >= 1.5"
+why = "X11 backend creates monitors with xrandr --setmonitor (RandR 1.5)"
+probe = { kind = "version", bins = ["xrandr"], args = ["--version"], regex = 'Server reports RandR version (\d+\.\d+)', min = "1.5", needs = ["display"], also_binary = "xrandr" }
+apt = "x11-xserver-utils"
+
+[[dep]]
+id = "gst-ximagesrc"
+phase = "runtime"
+level = "required"
+when = { session = ["x11"] }
+what = "ximagesrc"
+why = "X11 screen capture"
+probe = { kind = "gst-element", elements = ["ximagesrc"], plugin = "ximagesrc" }
+apt = "gstreamer1.0-plugins-good"
+
+[[dep]]
+id = "xclip"
+phase = "runtime"
+level = "optional"
+when = { session = ["x11"] }
+what = "xclip"
+why = "TUI 'copy URL' on X11"
+probe = { kind = "binary", name = "xclip", also_any = ["xsel"] }
+apt = ["xclip", "xsel"]
+
+# ───────────────────── runtime: GPU encoders ─────────────────────
+
+[[dep]]
+id = "render-node"
+phase = "runtime"
+level = "recommended"
+when = { gpu = ["intel", "amd", "nvidia"] }
+what = "read/write access to /dev/dri/renderD*"
+why = "hardware encoders open the GPU render node"
+probe = { kind = "access", glob = "/dev/dri/renderD*" }
+provider = "manual"
+hint = "sudo usermod -aG render,video $USER"
+after = "log out and back in"
+
+[[dep]]
+id = "va-intel"
+phase = "runtime"
+level = "recommended"
+when = { gpu = ["intel"] }
+what = "Intel VA-API driver (iHD)"
+why = "VA-API H.264/H.265 encode on Intel Broadwell (gen8) and newer"
+probe = { kind = "file", glob = "/usr/lib/{multiarch}/dri/iHD_drv_video.so" }
+# non-free (multiverse) has the full encoder set; the free build is the fallback.
+apt = ["intel-media-va-driver-non-free", "intel-media-va-driver"]
+hint = "for the non-free driver: sudo add-apt-repository multiverse. Pre-2014 Intel GPUs need i965-va-driver instead"
+
+[[dep]]
+id = "va-amd"
+phase = "runtime"
+level = "recommended"
+when = { gpu = ["amd"] }
+what = "Mesa VA-API driver (radeonsi)"
+why = "VA-API H.264/H.265 encode on AMD"
+probe = { kind = "file", glob = "/usr/lib/{multiarch}/dri/radeonsi_drv_video.so" }
+apt = "mesa-va-drivers"
+
+[[dep]]
+id = "gst-va"
+phase = "runtime"
+level = "recommended"
+when = { gpu = ["intel", "amd"] }
+what = "GStreamer VA encoders (vah264enc, vah265enc)"
+why = "hardware encode via VA-API"
+# covers = other elements from the same plugin that castdeskd tries but doesn't require
+probe = { kind = "gst-element", elements = ["vah264enc"], covers = ["vah265enc", "vah264lpenc", "vah265lpenc"], plugin = "va" }
+apt = "gstreamer1.0-plugins-bad"
+after = "elements only register once a working VA driver is installed"
+
+[[dep]]
+id = "gst-vaapi-legacy"
+phase = "runtime"
+level = "optional"
+when = { gpu = ["intel", "amd"] }
+what = "legacy gstreamer-vaapi encoders (vaapih264enc, vaapih265enc)"
+why = "last-resort VA-API path for drivers the newer `va` plugin rejects"
+probe = { kind = "gst-element", elements = ["vaapih264enc"], covers = ["vaapih265enc"], plugin = "vaapi" }
+apt = "gstreamer1.0-vaapi"
+
+[[dep]]
+id = "vainfo"
+phase = "runtime"
+level = "optional"
+when = { gpu = ["intel", "amd"] }
+what = "vainfo"
+why = "diagnoses VA-API (used for the encode-capability check below)"
+probe = { kind = "binary", name = "vainfo" }
+apt = "vainfo"
+
+[[dep]]
+id = "va-h264-encode"
+phase = "runtime"
+level = "recommended"
+when = { gpu = ["intel", "amd"] }
+what = "GPU advertises VA-API H.264 encoding"
+why = "otherwise castdeskd falls back to x264 (CPU)"
+probe = { kind = "command", cmd = ["vainfo", "--display", "drm"], regex = 'VAProfileH264\w*\s*:\s*VAEntrypointEncSlice', requires_binary = "vainfo" }
+provider = "manual"
+hint = "install the VA driver above; check `vainfo --display drm`. Some AMD APUs only expose low-power encode (vah264lpenc), which castdeskd also tries"
+
+[[dep]]
+id = "nvidia-driver"
+phase = "runtime"
+level = "recommended"
+when = { gpu = ["nvidia"] }
+what = "NVIDIA proprietary driver loaded"
+why = "NVENC needs it (nouveau has no encoder)"
+probe = { kind = "file", glob = "/proc/driver/nvidia/version" }
+provider = "driver"
+hint = "sudo ubuntu-drivers install   (driver >= 555 recommended for Wayland screencasts)"
+after = "reboot"
+
+[[dep]]
+id = "nvenc-lib"
+phase = "runtime"
+level = "recommended"
+when = { gpu_driver = ["nvidia"] }
+what = "libnvidia-encode matching the loaded driver"
+why = "nvh264enc loads libnvidia-encode.so.1 at runtime"
+probe = { kind = "file", glob = "/usr/lib/{multiarch}/libnvidia-encode.so.1" }
+apt = "libnvidia-encode-{nvidia_major}"
+
+[[dep]]
+id = "gst-nvcodec"
+phase = "runtime"
+level = "recommended"
+when = { gpu_driver = ["nvidia"] }
+what = "nvh264enc / nvh265enc"
+why = "hardware encode via NVENC"
+probe = { kind = "gst-element", elements = ["nvh264enc"], covers = ["nvh265enc"], plugin = "nvcodec" }
+apt = "gstreamer1.0-plugins-bad"
+after = "nvcodec registers its elements only when the driver and libnvidia-encode are present"
+
+# ──────────────────────── optional features ──────────────────────
+
+[[dep]]
+id = "kernel-headers"
+phase = "runtime"
+level = "required"
+features = ["evdi"]
+what = "headers for the running kernel"
+why = "DKMS builds the evdi module against them"
+probe = { kind = "file", glob = "/lib/modules/{kernel}/build/Makefile" }
+apt = "linux-headers-{kernel}"
+
+[[dep]]
+id = "evdi"
+phase = "runtime"
+level = "required"
+features = ["evdi"]
+what = "evdi kernel module (DKMS)"
+why = "evdi virtual display backend; only needed when the compositor backends don't work"
+probe = { kind = "kmod", name = "evdi" }
+apt = "evdi-dkms"
+hint = "needs root. With Secure Boot on, DKMS asks you to enroll a MOK key on the next boot"
+after = "sudo modprobe evdi (or reboot)"

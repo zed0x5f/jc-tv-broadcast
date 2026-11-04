@@ -231,13 +231,12 @@ pub fn detail_lines(d: &DisplayStatus) -> Vec<Line<'static>> {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    if let Some((msg, ok, at)) = &app.toast {
-        if at.elapsed() < Duration::from_secs(6) {
+    if let Some((msg, ok, at)) = &app.toast
+        && at.elapsed() < Duration::from_secs(6) {
             let c = if *ok { Color::Green } else { Color::Red };
             f.render_widget(Paragraph::new(Span::styled(format!(" {msg}"), Style::new().fg(c))), area);
             return;
         }
-    }
     let keys = [
         ("a", "add"), ("d", "delete"), ("r", "restart"), ("c", "copy URL"),
         ("s/S", "start/stop daemon"), ("l", "logs"), ("?", "help"), ("q", "quit"),
