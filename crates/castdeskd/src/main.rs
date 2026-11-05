@@ -1,8 +1,8 @@
 //! castdeskd — CastDesk daemon: virtual displays → one encode → network streams.
 //!
 //! Testing: `run` is exercised by `scripts/selftest-stage-a.sh` (headless,
-//! test backend). `doctor` has been run in a headless container only: there
-//! was no desktop session and no GPU, so only x264/x265 were probed.
+//! test backend) and by hand under systemd on GNOME. `doctor` has been run
+//! headless and on an Intel GNOME laptop.
 
 mod api;
 mod audio; // stub, stage (b)
@@ -98,6 +98,11 @@ async fn main() -> Result<()> {
         let mtx = mediamtx::locate(&cfg.mediamtx);
         println!("mediamtx: {}", mtx.map(|p| p.display().to_string()).unwrap_or("NOT FOUND".into()));
         println!("lan ip:   {}", lan_ip().map(|i| i.to_string()).unwrap_or("?".into()));
+        // Blocked UDP is the most common "receiver hangs" cause: players try
+        // RTSP over UDP first and only fall back to TCP after a timeout.
+        for (port, proto, what) in mediamtx::lan_ports(&cfg.mediamtx) {
+            println!("port:     {port}/{proto:<4} {what} (open in the firewall for LAN receivers)");
+        }
         println!("\nfor missing pieces → packages, run: castdesk-deps");
         return Ok(());
     }

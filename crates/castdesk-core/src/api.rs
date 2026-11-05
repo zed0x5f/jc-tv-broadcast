@@ -154,7 +154,66 @@ impl VideoSettings {
         if !(0.1..=10.0).contains(&self.gop_seconds) {
             return Err("gop_seconds must be 0.1-10".into());
         }
+        if self.codec == Codec::H264 && self.h264_level().is_none() {
+            return Err(format!(
+                "{}x{} @ {} fps at {} kb/s is beyond H.264 level 5.2, which almost no receiver decodes \
+                 (max ≈ 4096x2160 @ 60): lower the resolution, fps or bitrate, or use H.265",
+                self.width, self.height, self.fps, self.bitrate_kbps
+            ));
+        }
         Ok(())
+    }
+
+    /// Lowest H.264 level (High profile) that can carry these settings, e.g.
+    /// "4.2"; `None` if it needs more than 5.2. Limits from ITU-T H.264
+    /// Table A-1: macroblocks per frame, macroblocks per second, bitrate
+    /// (High profile allows 1.25× the base bitrate).
+    pub fn h264_level(&self) -> Option<&'static str> {
+        // (level, MaxFS, MaxMBPS, MaxBR kb/s for Baseline/Main)
+        const LEVELS: &[(&str, u64, u64, u64)] = &[
+            ("3.1", 3_600, 108_000, 14_000),
+            ("3.2", 5_120, 216_000, 20_000),
+            ("4", 8_192, 245_760, 20_000),
+            ("4.1", 8_192, 245_760, 50_000),
+            ("4.2", 8_704, 522_240, 50_000),
+            ("5", 22_080, 589_824, 135_000),
+            ("5.1", 36_864, 983_040, 240_000),
+            ("5.2", 36_864, 2_073_600, 240_000),
+        ];
+        let mbs = |px: u32| u64::from(px.div_ceil(16));
+        let (w, h) = (mbs(self.width), mbs(self.height));
+        let frame = w * h;
+        let rate = frame * u64::from(self.fps);
+        let br = u64::from(self.bitrate_kbps);
+        LEVELS
+            .iter()
+            .find(|&&(_, max_fs, max_mbps, max_br)| {
+                // Neither side may exceed sqrt(8 * MaxFS) macroblocks.
+                let side = ((8 * max_fs) as f64).sqrt() as u64;
+                frame <= max_fs && w <= side && h <= side && rate <= max_mbps && br * 4 <= max_br * 5
+            })
+            .map(|l| l.0)
+    }
+
+    /// Settings that work but that some receivers can't play. Shown to the
+    /// user; never an error.
+    pub fn compat_warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        match self.codec {
+            Codec::H265 => w.push(
+                "H.265: browsers, many older TVs and some Android TV players can't decode it; use H.264 if a receiver shows nothing".into(),
+            ),
+            Codec::H264 => {
+                if let Some(level) = self.h264_level()
+                    && !matches!(level, "3.1" | "3.2" | "4" | "4.1" | "4.2")
+                {
+                    w.push(format!(
+                        "needs H.264 level {level}: many TVs and streaming sticks only decode up to 4.2 (1080p60)"
+                    ));
+                }
+            }
+        }
+        w
     }
 }
 
@@ -367,4 +426,46 @@ pub struct SystemInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(width: u32, height: u32, fps: u32, bitrate_kbps: u32) -> VideoSettings {
+        VideoSettings { width, height, fps, bitrate_kbps, ..Default::default() }
+    }
+
+    #[test]
+    fn h264_levels() {
+        assert_eq!(v(1280, 720, 30, 4_000).h264_level(), Some("3.1"));
+        assert_eq!(v(1280, 720, 60, 8_000).h264_level(), Some("3.2"));
+        assert_eq!(v(1920, 1080, 30, 12_000).h264_level(), Some("4"));
+        assert_eq!(v(1920, 1080, 30, 30_000).h264_level(), Some("4.1"));
+        // The default (1080p60, 12 Mb/s) fits the level every 1080p TV decodes.
+        assert_eq!(VideoSettings::default().h264_level(), Some("4.2"));
+        assert_eq!(v(2560, 1440, 60, 20_000).h264_level(), Some("5.1"));
+        assert_eq!(v(3840, 2160, 30, 20_000).h264_level(), Some("5.1"));
+        assert_eq!(v(3840, 2160, 60, 40_000).h264_level(), Some("5.2"));
+        assert_eq!(v(7680, 4320, 30, 40_000).h264_level(), None);
+        // 1366 wide is not a multiple of 16; it still fits 4.x.
+        assert_eq!(v(1366, 768, 60, 12_000).h264_level(), Some("4.2"));
+    }
+
+    #[test]
+    fn validation_rejects_impossible_h264_only() {
+        assert!(VideoSettings::default().validate().is_ok());
+        let eight_k = v(7680, 4320, 30, 40_000);
+        assert!(eight_k.validate().unwrap_err().contains("level 5.2"));
+        let hevc = VideoSettings { codec: Codec::H265, ..eight_k };
+        assert!(hevc.validate().is_ok());
+    }
+
+    #[test]
+    fn warnings() {
+        assert!(VideoSettings::default().compat_warnings().is_empty());
+        assert!(v(3840, 2160, 30, 20_000).compat_warnings()[0].contains("level 5.1"));
+        let hevc = VideoSettings { codec: Codec::H265, ..Default::default() };
+        assert!(hevc.compat_warnings()[0].contains("H.265"));
+    }
 }

@@ -224,11 +224,24 @@ pub fn detail_lines(d: &DisplayStatus) -> Vec<Line<'static>> {
         ),
     ));
     lines.push(Line::from(""));
+    for w in v.compat_warnings() {
+        lines.push(kv("Note", Span::styled(w, Style::new().fg(Color::Yellow))));
+    }
     for u in &d.urls {
-        lines.push(kv("Stream", Span::styled(u.url.clone(), Style::new().bold().underlined())));
-        lines.push(kv("  VLC", Span::raw(format!("vlc --network-caching=200 {}", u.url)).dark_gray()));
-        lines.push(kv("  mpv", Span::raw(format!("mpv --profile=low-latency --untimed --rtsp-transport=udp {}", u.url)).dark_gray()));
-        lines.push(kv("  ffplay", Span::raw(format!("ffplay -fflags nobuffer -flags low_delay -framedrop {}", u.url)).dark_gray()));
+        let label = match u.kind.as_str() {
+            "hls" => "HLS",
+            "webrtc" => "WebRTC",
+            _ => "Stream",
+        };
+        lines.push(kv(label, Span::styled(u.url.clone(), Style::new().bold().underlined())));
+        if u.kind != "rtsp" {
+            continue;
+        }
+        // TCP: works through firewalls that block RTP/UDP and doesn't smear
+        // on lossy Wi-Fi. Drop the flag for the lowest latency on wired LANs.
+        lines.push(kv("  VLC", Span::raw(format!("vlc --rtsp-tcp --network-caching=200 {}", u.url)).dark_gray()));
+        lines.push(kv("  mpv", Span::raw(format!("mpv --profile=low-latency --untimed --rtsp-transport=tcp {}", u.url)).dark_gray()));
+        lines.push(kv("  ffplay", Span::raw(format!("ffplay -rtsp_transport tcp -fflags nobuffer -flags low_delay -framedrop {}", u.url)).dark_gray()));
     }
     lines
 }

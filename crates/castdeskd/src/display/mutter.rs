@@ -5,7 +5,10 @@
 //! asks pipewiresrc for exactly width×height. No portal dialog is involved.
 //! The monitor disappears when we call Stop or our D-Bus connection drops.
 //!
-//! Testing: none. No unit tests, and never run against a GNOME session.
+//! Testing: no unit tests. Run by hand on GNOME (Wayland) / Ubuntu 26.04,
+//! PipeWire 1.6: the virtual monitor appears (as `Meta-0`), streams at
+//! 1920x1080, and is recreated from the config file on daemon start.
+//! Not checked: stop/teardown details, AccessDenied fallback to `portal`.
 
 use std::collections::HashMap;
 use std::time::Duration;

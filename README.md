@@ -50,7 +50,10 @@ flowchart LR
   nobody on the LAN can hijack a path.
 - **Stable encoder output.** CBR, no B-frames, 1 s GOP, `config-interval=-1`
   (SPS/PPS on every keyframe), so a receiver joining mid-stream starts within
-  about 1 s.
+  about 1 s. Keyframes are also forced by wall-clock time, because a static
+  screencast sends only 1-2 frames a second: on a static GNOME desktop a
+  GStreamer receiver joined in about 2 s (ffmpeg-based players take ~7 s
+  to analyse such a slow stream).
 
 ### Virtual display backends (picked at runtime)
 
@@ -114,6 +117,8 @@ advertise_host = ""         # IP/hostname shown in URLs; empty = auto-detect LAN
 [mediamtx]
 managed = true              # false = use your own RTSP server on rtsp_port
 rtsp_port = 8554
+hls = false                 # also serve HLS on :8888 (browsers, TVs without RTSP)
+webrtc = false              # also serve WebRTC on :8889 (browsers)
 
 [[display]]
 name = "tv1"                # → rtsp://<laptop>:8554/tv1
@@ -123,7 +128,7 @@ width = 1920
 height = 1080
 fps = 60
 bitrate_kbps = 12000
-codec = "h264"              # h264 | h265
+codec = "h264"              # h264 (plays everywhere) | h265 (many TVs/browsers can't)
 encoder = "auto"            # auto | vaapi | nvenc | software
 gop_seconds = 1.0
 ```
@@ -161,8 +166,11 @@ copy-paste player commands.
 scripts/selftest-stage-a.sh          # uses ~/.local/share/castdesk/bin/mediamtx
 ```
 
-Success is nine `PASS` lines ending in `stage (a) self-test OK`. It uses its
-own ports (17650/18554), so it can run next to your real daemon.
+Success is thirteen `PASS` lines ending in `stage (a) self-test OK` (one
+`WARN` about colour tags is expected with `vah264enc`, see
+[docs/receivers.md](docs/receivers.md)). It uses its own ports (17650/18554/
+18888/18889), so it can run next to your real daemon. `ENCODER=software`
+forces x264enc (also `vaapi`, `nvenc`).
 
 **2. A real virtual monitor.**
 
@@ -180,24 +188,28 @@ Success looks like this:
   lists it.
 - **X11:** `xrandr --listmonitors` shows `CastDesk-tv1`.
 - **In the TUI:** state is `running`, fps is close to your setting while
-  something moves, and bitrate is near 12 Mb/s on busy content (CBR pads, so
-  it stays close even when the screen is static).
+  something moves, and bitrate is near 12 Mb/s on busy content. On a static
+  screen both drop to almost nothing (a few fps from the keepalive, a few kb/s),
+  since screencasts only deliver frames on change. That's normal.
 
 **3. Watch it from another machine** (or the laptop itself).
 `<laptop>` is the IP the TUI shows:
 
 ```bash
-vlc --network-caching=200 rtsp://<laptop>:8554/tv1
-mpv --profile=low-latency --untimed --rtsp-transport=udp rtsp://<laptop>:8554/tv1
-ffplay -fflags nobuffer -flags low_delay -framedrop rtsp://<laptop>:8554/tv1
+vlc --rtsp-tcp --network-caching=200 rtsp://<laptop>:8554/tv1     # needs VLC's live555 module, see below
+mpv --profile=low-latency --untimed --rtsp-transport=tcp rtsp://<laptop>:8554/tv1
+ffplay -rtsp_transport tcp -fflags nobuffer -flags low_delay -framedrop rtsp://<laptop>:8554/tv1
 ffprobe -v error -show_entries stream=codec_name,width,height,has_b_frames rtsp://<laptop>:8554/tv1
 ```
 
 `ffprobe` should print `h264`, `1920`, `1080` and `has_b_frames=0`. The
-TUI's client count goes up for each viewer.
+TUI's client count goes up for each viewer. TCP is the safe choice on Wi-Fi
+and through firewalls. Drop the flag on a wired LAN for slightly lower latency.
+Which players and TVs work, and the HLS/WebRTC fallbacks:
+[docs/receivers.md](docs/receivers.md).
 
 **4. Resilience.** `pkill mediamtx` makes the display go `restarting` and
-come back to `running` within about 3 s. Viewers reconnect: mpv/ffplay do it
+come back to `running` within about 7 s. Viewers reconnect: mpv/ffplay do it
 on their own; VLC needs a replay.
 
 ## Test status
@@ -209,15 +221,16 @@ comment says the same thing for that file.
 |---|---|---|
 | Config, validation, stage (b) stub rejection | unit tests | — |
 | Session detection | unit tests (synthetic GNOME/KDE/Sway/X11/headless env) | inside a real desktop session |
-| `mutter` / `portal` backends | — | **never run** against GNOME or KDE |
+| `mutter` backend | by hand on GNOME (Wayland), Ubuntu 26.04: monitor appears, 1080p30 stream decodes over RTSP/UDP, recreated from config on start | AccessDenied → `portal` fallback; window moved onto it under load |
+| `portal` backend | — | **never run** against KDE or GNOME |
 | `wlroots` / `x11` backends | unit tests for output parsing and placement math | **never run** against Sway, Hyprland or an X server |
-| `test` backend → x264enc → MediaMTX → RTSP | `scripts/selftest-stage-a.sh`: all 9 checks pass (Ubuntu 24.04 container, GStreamer 1.24.2, MediaMTX v1.21.3, no GPU) | — |
-| Encoders | x264enc/x265enc probe + encode; selection logic unit-tested | VA-API and NVENC on real hardware |
-| Daemon supervision | self-test: MediaMTX kill → back to `running` | recreating the virtual display after repeated failures; `restart` endpoint |
+| `test` backend → encoder → MediaMTX → RTSP/HLS/WebRTC | `scripts/selftest-stage-a.sh`: all 13 checks pass on an Ubuntu 26.04 Intel laptop (GStreamer 1.28.2, MediaMTX v1.21.3) with both `vah264enc` (`auto`; warns: no colour tags) and `x264enc` (`ENCODER=software`). The earlier 9-check version also passed in an Ubuntu 24.04 container (x264enc, no GPU). | the 13-check version on 24.04; WebRTC media (only the player page is fetched) |
+| Encoders | x264enc/x265enc probe + encode; selection logic unit-tested; Intel Comet Lake: vah264enc streams, vah265enc probes OK, vah264lpenc rejected (no CBR in low-power mode) | NVENC, AMD VA-API |
+| Daemon supervision | self-test, and by hand on GNOME: MediaMTX kill → back to `running` in ~7 s; RTSP client count; 4 displays at once; 3 viewers on one display | recreating the virtual display after repeated failures; the stall detector (added after an intermittent freeze); `restart` endpoint |
 | Control API | self-test: 401 without token, add/get/delete display | `/system`, `/health`, list, `restart` |
 | TUI | rendering + add form (ratatui TestBackend, canned data) | against a live daemon; start/stop daemon, logs, clipboard |
-| Dependency checker | 19 Python tests on faked machines | `install.sh` end to end. Its MediaMTX checksum step was run alone and fixed. |
-| Receivers | ffprobe/ffmpeg over RTSP TCP and UDP (self-test) | VLC, mpv, Raspberry Pi, Android TV |
+| Dependency checker | 19 Python tests on faked machines; `install.sh` run end to end on Ubuntu 26.04 (GNOME, Intel) | Ubuntu 24.04, KDE, Sway, NVIDIA machines |
+| Receivers | ffprobe/ffmpeg over RTSP TCP and UDP, and over HLS (self-test, which also checks profile, level ≤ 4.2, yuv420p and colour tags); GStreamer rtspsrc + vah264dec and ffmpeg over the LAN address; join time on a static screen measured | VLC with live555 (Ubuntu's VLC can't play RTSP), mpv, Raspberry Pi, Android TV, another machine on the LAN |
 | Stage (b)/(c) stubs | each stub's "not implemented" error | — (no functionality yet) |
 
 ## Setup notes per desktop
@@ -242,7 +255,9 @@ comment says the same thing for that file.
 
 | Symptom | Fix |
 |---|---|
-| Receivers can't connect | Open the firewall: **TCP 8554** (RTSP) and **UDP 8000–8001** (RTP/RTCP for UDP readers). `sudo ufw allow 8554/tcp && sudo ufw allow 8000:8001/udp` or `sudo firewall-cmd --add-port=8554/tcp --add-port=8000-8001/udp --permanent && sudo firewall-cmd --reload`. If UDP is blocked, players fall back to TCP (`--rtsp-transport=tcp`). |
+| VLC: "unable to open the MRL" | Your VLC has no RTSP support. Debian/Ubuntu builds don't ship VLC's live555 module (Ubuntu 26.04's archive has no live555 at all), so VLC falls back to modules that can't talk to MediaMTX (the log shows `satip` and `access_realrtsp`). Use the VLC snap or Flatpak, which bundle it (`sudo snap install vlc`), or another player: `ffplay`, `mpv`, `gst-play-1.0`. |
+| A TV or app connects but shows nothing | Usually the codec: switch the display to H.264, and keep it at 1080p60 or below (H.264 level 4.2). The TUI shows a yellow `Note` when the settings may be too much for some receivers. If the player can't do RTSP at all, enable `hls` or `webrtc` (see [docs/receivers.md](docs/receivers.md)). |
+| Receivers can't connect | `castdeskd doctor` lists every port to open. Open the firewall: **TCP 8554** (RTSP) and **UDP 8000–8001** (RTP/RTCP for UDP readers). `sudo ufw allow 8554/tcp && sudo ufw allow 8000:8001/udp` or `sudo firewall-cmd --add-port=8554/tcp --add-port=8000-8001/udp --permanent && sudo firewall-cmd --reload`. If UDP is blocked, players fall back to TCP (`--rtsp-transport=tcp`). |
 | URL shows the wrong IP | Set `[daemon] advertise_host = "192.168.1.20"` (or `laptop.local`). |
 | `no working H.264 encoder` | Run `castdeskd doctor`. Intel: `intel-media-va-driver-non-free`; AMD: `mesa-va-drivers` (Fedora: `mesa-va-drivers-freeworld` from RPM Fusion); software: `gstreamer1.0-plugins-ugly`. Check `vainfo` lists `VAProfileH264*: VAEntrypointEncSlice`. |
 | **NVIDIA** | Needs the proprietary driver ≥ 535 and `nvh264enc` (gst-plugins-bad, built with nvcodec). Consumer GPUs limit concurrent NVENC sessions (driver-dependent, typically 5–8); if a display keeps restarting with an NVENC error, give it `encoder = "software"`. On Wayland, use driver ≥ 555 for working PipeWire DMA-BUF screencasts; on older drivers GNOME screencasts can be black. Set `encoder = "software"` to rule NVENC out. |
@@ -263,7 +278,7 @@ crates/castdeskd       daemon: session detection, display backends, encoders, pi
 crates/castdesk-tui    ratatui front end
 packaging/             install.sh, deps.toml + castdesk-deps (runtime dependency detection),
                        systemd user unit, .desktop file
-docs/                  dependencies.md, control-protocol.md (draft, stage c)
+docs/                  dependencies.md, receivers.md, control-protocol.md (draft, stage c)
 receivers/media3/      placeholder for the Android receiver app (stage c, no code yet)
 scripts/               selftest-stage-a.sh (headless end-to-end check)
 ```

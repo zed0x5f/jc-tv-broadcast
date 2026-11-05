@@ -8,9 +8,12 @@
 //!
 //! Testing: gst-launch strings are unit-tested for every source and encoder
 //! variant, and a full pipeline is built with x264enc. The only source run
-//! end-to-end (self-test) is `Test` (videotestsrc) + x264enc + rtspclientsink.
-//! The PipeWire and X11 sources are string-tested only and have never captured
-//! a real screen.
+//! end-to-end (self-test) is `Test` (videotestsrc) + rtspclientsink, with
+//! vah264enc and x264enc; it checks the receiver-facing profile, level, pixel
+//! format and colour tags with ffprobe.
+//! The PipeWire source has been run by hand with a Mutter virtual monitor +
+//! vah264enc (that run found the `target-object` bug, see below). The X11
+//! source is string-tested only.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,15 +51,8 @@ impl Drop for StreamPipeline {
     }
 }
 
-fn element_has_property(factory: &str, prop: &str) -> bool {
-    gst::ElementFactory::make(factory)
-        .build()
-        .map(|e| e.find_property(prop).is_some())
-        .unwrap_or(false)
-}
-
 /// The capture half of the pipeline, as gst-launch syntax.
-pub fn source_description(src: &CaptureSource, v: &VideoSettings, pw_target_object: bool) -> String {
+pub fn source_description(src: &CaptureSource, v: &VideoSettings) -> String {
     match src {
         CaptureSource::PipeWire {
             node_id,
@@ -64,11 +60,12 @@ pub fn source_description(src: &CaptureSource, v: &VideoSettings, pw_target_obje
             ..
         } => {
             let fd = src.raw_fd().map(|fd| format!(" fd={fd}")).unwrap_or_default();
-            let target = if pw_target_object {
-                format!("target-object={node_id}")
-            } else {
-                format!("path={node_id}")
-            };
+            // `path` takes the numeric node id that Mutter and the portal hand
+            // us. `target-object` looks like its replacement but only matches
+            // a node *name or serial*, so it fails with "target not found"
+            // (verified on GNOME 50 / PipeWire 1.6). `path` is deprecated but
+            // still supported.
+            let target = format!("path={node_id}");
             // keepalive-time: screencasts are damage-driven; resend the last
             // frame on a static desktop so receivers never stall.
             let mut s = format!(
@@ -103,34 +100,69 @@ pub fn source_description(src: &CaptureSource, v: &VideoSettings, pw_target_obje
 }
 
 /// Full pipeline description (encoder properties are applied afterwards).
-pub fn description(p: &PipelineParams<'_>, pw_target_object: bool) -> String {
+///
+/// Receiver compatibility is pinned here rather than left to each encoder:
+/// - `colorimetry=bt709`: the stream is tagged BT.709 limited range, so TVs
+///   don't guess the colour matrix or range (washed-out or crushed blacks).
+/// - `encoder::output_caps`: a profile TV decoders accept, whichever encoder
+///   family is picked.
+///
+/// The frame rate is deliberately left variable: a static screen sends a few
+/// frames a second instead of encoding identical frames at full rate (see
+/// `force_keyframes_by_time` for how joining stays fast).
+pub fn description(p: &PipelineParams<'_>) -> String {
     let v = p.video;
     let parser = encoder::parser_for(v.codec);
     format!(
         "{src} \
          ! queue name=capq max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
          ! videoconvert n-threads=4 ! videoscale \
-         ! video/x-raw,format={fmt},width={w},height={h},pixel-aspect-ratio=1/1 \
+         ! video/x-raw,format={fmt},width={w},height={h},pixel-aspect-ratio=1/1,colorimetry=bt709 \
          ! queue name=encq max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
          ! {enc} name=enc \
+         ! {enc_caps} \
          ! {parser} config-interval=-1 \
          ! identity name=stats silent=true \
          ! tee name=t allow-not-linked=true \
          t. ! queue name=q_rtsp max-size-buffers=0 max-size-bytes=0 max-size-time=500000000 leaky=downstream \
             ! rtspclientsink name=rtsp location={url} protocols=tcp latency=0",
-        src = source_description(p.source, v, pw_target_object),
+        src = source_description(p.source, v),
         w = v.width,
         h = v.height,
         enc = p.encoder,
+        enc_caps = encoder::output_caps(v.codec),
         fmt = encoder::input_format(p.encoder),
         url = p.rtsp_publish,
     )
 }
 
+/// Ask the encoder for a keyframe every `gop_seconds` of wall-clock time.
+///
+/// The encoder's own keyframe interval counts *frames* (fps × gop_seconds),
+/// but screencasts only deliver frames when the screen changes: about 2 fps on
+/// a static desktop, from `keepalive-time`. So a 30-frame GOP became a keyframe
+/// every ~15 s, and a viewer joining a static screen waited 7-30 s for its
+/// first picture (measured on GNOME). A timed GstForceKeyUnit request fixes
+/// that whatever the frame rate. The thread ends when the pipeline is dropped.
+fn force_keyframes_by_time(enc: &gst::Element, gop_seconds: f32) {
+    let Some(pad) = enc.static_pad("sink") else { return };
+    let weak = pad.downgrade();
+    let every = std::time::Duration::from_secs_f32(gop_seconds);
+    std::thread::Builder::new()
+        .name("castdesk-keyframes".into())
+        .spawn(move || loop {
+            std::thread::sleep(every);
+            let Some(pad) = weak.upgrade() else { break };
+            let s = gst::Structure::builder("GstForceKeyUnit")
+                .field("all-headers", true)
+                .build();
+            pad.send_event(gst::event::CustomDownstream::new(s));
+        })
+        .ok();
+}
+
 pub fn build(p: &PipelineParams<'_>) -> Result<StreamPipeline> {
-    let pw_target = matches!(p.source, CaptureSource::PipeWire { .. })
-        && element_has_property("pipewiresrc", "target-object");
-    let desc = description(p, pw_target);
+    let desc = description(p);
     tracing::debug!(pipeline = %desc, "building");
     let pipeline = gst::parse::launch(&desc)
         .with_context(|| format!("parsing pipeline: {desc}"))?
@@ -138,7 +170,8 @@ pub fn build(p: &PipelineParams<'_>) -> Result<StreamPipeline> {
         .map_err(|_| anyhow!("not a pipeline"))?;
 
     let enc = pipeline.by_name("enc").ok_or_else(|| anyhow!("no encoder"))?;
-    encoder::configure(&enc, p.encoder, p.video);
+    encoder::configure(&enc, p.encoder, p.video)?;
+    force_keyframes_by_time(&enc, p.video.gop_seconds);
 
     let counters = Arc::new(Counters::default());
 
@@ -179,9 +212,8 @@ mod tests {
         let s = source_description(
             &CaptureSource::PipeWire { fd: None, node_id: 42, drives_size: true },
             &v,
-            true,
         );
-        assert!(s.starts_with("pipewiresrc target-object=42"));
+        assert!(s.starts_with("pipewiresrc path=42"));
         assert!(s.contains("width=1920,height=1080"));
         assert!(!s.contains(" fd="));
     }
@@ -192,7 +224,6 @@ mod tests {
         let s = source_description(
             &CaptureSource::X11 { display: ":0".into(), x: 1920, y: 0, width: 1280, height: 720 },
             &v,
-            false,
         );
         assert!(s.contains("startx=1920 starty=0 endx=3199 endy=719"));
     }
@@ -231,7 +262,7 @@ mod tests {
                     source: src,
                     rtsp_publish: "rtsp://127.0.0.1:1/x".into(),
                 };
-                for segment in description(&p, true).split('!') {
+                for segment in description(&p).split('!') {
                     let el = segment.split_whitespace().next().unwrap_or_default();
                     if !el.is_empty() && !el.contains('/') && !el.ends_with('.') {
                         used.insert(el.to_string());
@@ -256,8 +287,10 @@ mod tests {
             source: &CaptureSource::Test,
             rtsp_publish: "rtsp://127.0.0.1:1/x".into(),
         };
-        let d = description(&p, false);
+        let d = description(&p);
         assert!(d.contains("h264parse config-interval=-1"));
+        assert!(d.contains("colorimetry=bt709"));
+        assert!(d.contains("! video/x-h264,profile=(string){high,main,constrained-baseline} !"));
         if gst::ElementFactory::find("x264enc").is_some()
             && gst::ElementFactory::find("rtspclientsink").is_some()
         {

@@ -51,6 +51,20 @@ pub struct MediaMtxConfig {
     /// RTP/RTCP UDP ports for UDP RTSP readers (open these in the firewall).
     pub rtp_port: u16,
     pub rtcp_port: u16,
+    /// Also serve every display as HLS, for receivers without RTSP (browsers,
+    /// smart-TV players, Kodi): http://host:<hls_port>/<name>/index.m3u8.
+    /// MediaMTX repackages the same encode, so this costs no encoding.
+    pub hls: bool,
+    pub hls_port: u16,
+    /// "mpegts" (plays almost anywhere, ~3-4 s latency), "fmp4", or
+    /// "lowLatency" (LL-HLS, ~1 s, but older players and TVs may not support it).
+    pub hls_variant: String,
+    /// Also serve every display over WebRTC, for browsers:
+    /// http://host:<webrtc_port>/<name>/ is a player page, `/whep` the endpoint.
+    pub webrtc: bool,
+    pub webrtc_port: u16,
+    /// UDP port for WebRTC media (open it in the firewall).
+    pub webrtc_udp_port: u16,
 }
 
 impl Default for MediaMtxConfig {
@@ -62,9 +76,17 @@ impl Default for MediaMtxConfig {
             api_port: 9997,
             rtp_port: 8000,
             rtcp_port: 8001,
+            hls: false,
+            hls_port: 8888,
+            hls_variant: "mpegts".into(),
+            webrtc: false,
+            webrtc_port: 8889,
+            webrtc_udp_port: 8189,
         }
     }
 }
+
+pub const HLS_VARIANTS: [&str; 3] = ["mpegts", "fmp4", "lowLatency"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -112,6 +134,13 @@ impl Config {
             if !seen.insert(&d.name) {
                 return Err(ConfigError::Invalid(format!("duplicate display {:?}", d.name)));
             }
+        }
+        if !HLS_VARIANTS.contains(&self.mediamtx.hls_variant.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "[mediamtx] hls_variant = {:?}: use one of {}",
+                self.mediamtx.hls_variant,
+                HLS_VARIANTS.join(", ")
+            )));
         }
         self.defaults.validate().map_err(ConfigError::Invalid)
     }

@@ -6,10 +6,13 @@
 //!
 //! Testing: the selection logic and per-encoder property sets are unit-tested.
 //! Real probes and encodes have run only for the software encoders (x264enc,
-//! x265enc). x264enc is also used end-to-end by the self-test. The VA-API and
-//! NVENC candidates have never run on real hardware.
+//! x265enc). x264enc is also used end-to-end by the self-test. On an Intel
+//! iGPU (Comet Lake, iHD driver, Ubuntu 26.04): vah264enc probes and streams
+//! 1080p30; vah265enc probes OK with target-usage 7; vah264lpenc is rejected
+//! (this GPU's low-power mode offers only CQP, no CBR).
+//! NVENC and AMD VA-API have never run.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{bail, Context, Result, anyhow};
 use castdesk_core::{Codec, EncoderInfo, EncoderPref, VideoSettings};
 use gst::prelude::*;
 
@@ -51,6 +54,17 @@ pub fn input_format(element: &str) -> &'static str {
     }
 }
 
+/// Caps forced right after the encoder so every encoder family emits a
+/// profile that TV decoders accept. H.264: 8-bit 4:2:0 High/Main/Constrained
+/// Baseline, never High 10 / 4:2:2 / 4:4:4 (common hardware decoders reject
+/// those). H.265: Main only (8-bit). The encoder picks within the list.
+pub fn output_caps(codec: Codec) -> &'static str {
+    match codec {
+        Codec::H264 => "video/x-h264,profile=(string){high,main,constrained-baseline}",
+        Codec::H265 => "video/x-h265,profile=(string)main",
+    }
+}
+
 pub fn parser_for(codec: Codec) -> &'static str {
     match codec {
         Codec::H264 => "h264parse",
@@ -70,7 +84,10 @@ pub fn low_latency_props(element: &str, v: &VideoSettings) -> Vec<(&'static str,
             ("key-int-max", gop),
             ("b-frames", "0".into()),
             ("ref-frames", "1".into()),
-            ("target-usage", "6".into()),
+            // 1 = best quality … 7 = fastest. Intel Gen9 (Skylake–Comet Lake)
+            // HEVC only accepts 1, 4 and 7: anything else fails the first
+            // frame. H.264 takes any value there.
+            ("target-usage", if element.starts_with("vah265") { "7" } else { "6" }.into()),
             ("cpb-size", (v.bitrate_kbps / 2).to_string()), // ~0.5 s VBV
         ],
         "vaapih264enc" | "vaapih265enc" => vec![
@@ -115,19 +132,34 @@ pub fn make_encoder(element: &str, v: &VideoSettings) -> Result<gst::Element> {
         .name("enc")
         .build()
         .with_context(|| format!("creating {element}"))?;
-    configure(&enc, element, v);
+    configure(&enc, element, v)?;
     Ok(enc)
 }
 
 /// Apply low-latency settings to an existing encoder element.
-pub fn configure(enc: &gst::Element, element: &str, v: &VideoSettings) {
+///
+/// Enum values are driver-dependent (e.g. Intel's low-power VA encoders may
+/// only offer `cqp`), so a rejected value is logged, not a panic. The one
+/// setting we insist on is constant-bitrate rate control: without it the
+/// bitrate setting means nothing, so the encoder is reported as unusable.
+pub fn configure(enc: &gst::Element, element: &str, v: &VideoSettings) -> Result<()> {
     for (prop, value) in low_latency_props(element, v) {
-        if enc.find_property(prop).is_some() {
-            enc.set_property_from_str(prop, &value);
-        } else {
+        let Some(pspec) = enc.find_property(prop) else {
             tracing::debug!(element, prop, "encoder lacks property, skipping");
+            continue;
+        };
+        // set_property_from_str() panics on a value the element rejects.
+        match gst::glib::Value::deserialize_with_pspec(&value, &pspec) {
+            Ok(val) => enc.set_property_from_value(prop, &val),
+            Err(e) => {
+                if matches!(prop, "rate-control" | "rc-mode") {
+                    bail!("{element} doesn't support {prop}={value} on this machine: {e}");
+                }
+                tracing::warn!(element, prop, value, "encoder rejected setting: {e}");
+            }
         }
     }
+    Ok(())
 }
 
 /// Encode a few frames to prove the encoder works on this machine.

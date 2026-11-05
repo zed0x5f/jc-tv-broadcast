@@ -1,8 +1,9 @@
 //! Virtual display backends. Each creates an extra monitor using existing
 //! compositor/X mechanisms (no custom kernel code) and returns a capture source.
 //!
-//! Testing: only the `test` backend has run (self-test). `auto` fallback across
-//! real backends has never been exercised.
+//! Testing: the `test` backend runs in the self-test; `mutter` has been run by
+//! hand on GNOME, where `auto` picked it first. Falling back from a failed
+//! backend to the next one has never been exercised.
 
 pub mod evdi; // stub, stage (b)
 pub mod mutter;

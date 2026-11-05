@@ -7,7 +7,11 @@
 //! Testing: version parsing and the generated config (publish restricted to
 //! localhost) are unit-tested. Supervision is exercised by the self-test
 //! against MediaMTX v1.21.3: startup, readers over TCP and UDP, and restart
-//! after the process is killed. `managed = false` (bring your own server) is
+//! after the process is killed (back to `running` in ~7 s, measured by hand).
+//! The path-info parser is tested against v1.21.3's JSON. The optional
+//! HLS/WebRTC outputs: config rendering and URLs are unit-tested; the
+//! self-test plays HLS with ffprobe and fetches the WebRTC player page (WebRTC
+//! media itself is untested). `managed = false` (bring your own server) is
 //! untested.
 
 use std::path::PathBuf;
@@ -100,9 +104,15 @@ rtpAddress: :{rtp}
 rtcpAddress: :{rtcp}
 
 rtmp: false
-hls: false
-webrtc: false
 srt: false
+
+# Optional fallbacks for receivers without RTSP. Same encode, repackaged.
+hls: {hls}
+hlsAddress: :{hls_port}
+hlsVariant: {hls_variant}
+webrtc: {webrtc}
+webrtcAddress: :{webrtc_port}
+webrtcLocalUDPAddress: :{webrtc_udp}
 {extra}
 paths:
   all_others:
@@ -111,17 +121,67 @@ paths:
         rtsp = cfg.rtsp_port,
         rtp = cfg.rtp_port,
         rtcp = cfg.rtcp_port,
+        hls = cfg.hls,
+        hls_port = cfg.hls_port,
+        hls_variant = cfg.hls_variant,
+        webrtc = cfg.webrtc,
+        webrtc_port = cfg.webrtc_port,
+        webrtc_udp = cfg.webrtc_udp_port,
         extra = extra,
     )
+}
+
+/// Every LAN-facing port MediaMTX listens on, for `doctor` and the docs:
+/// (port, protocol, what for).
+pub fn lan_ports(cfg: &MediaMtxConfig) -> Vec<(u16, &'static str, &'static str)> {
+    let mut v = vec![
+        (cfg.rtsp_port, "tcp", "RTSP"),
+        (cfg.rtp_port, "udp", "RTP, for UDP RTSP readers"),
+        (cfg.rtcp_port, "udp", "RTCP, for UDP RTSP readers"),
+    ];
+    if cfg.hls {
+        v.push((cfg.hls_port, "tcp", "HLS"));
+    }
+    if cfg.webrtc {
+        v.push((cfg.webrtc_port, "tcp", "WebRTC signalling/player page"));
+        v.push((cfg.webrtc_udp_port, "udp", "WebRTC media"));
+    }
+    v
+}
+
+/// Viewer URLs for one display: RTSP first, then any enabled fallbacks.
+pub fn stream_urls(cfg: &MediaMtxConfig, host: &str, name: &str) -> Vec<castdesk_core::StreamUrl> {
+    let url = |kind: &str, url: String| castdesk_core::StreamUrl { kind: kind.into(), url };
+    let mut v = vec![url("rtsp", format!("rtsp://{host}:{}/{name}", cfg.rtsp_port))];
+    if cfg.hls {
+        v.push(url("hls", format!("http://{host}:{}/{name}/index.m3u8", cfg.hls_port)));
+    }
+    if cfg.webrtc {
+        v.push(url("webrtc", format!("http://{host}:{}/{name}/", cfg.webrtc_port)));
+    }
+    v
 }
 
 #[derive(Deserialize)]
 struct PathInfo {
     #[serde(default)]
     readers: Vec<serde_json::Value>,
-    /// `online` in >= 1.15, `ready` in older releases.
-    #[serde(default, alias = "ready")]
-    online: bool,
+    /// `online` in >= 1.15. Not a serde alias of `ready`: v1.21 sends both
+    /// keys, and an alias makes that a "duplicate field" parse error.
+    #[serde(default)]
+    online: Option<bool>,
+    /// The only flag in releases before 1.15.
+    #[serde(default)]
+    ready: bool,
+}
+
+impl PathInfo {
+    fn state(&self) -> PathState {
+        PathState {
+            online: self.online.unwrap_or(self.ready),
+            readers: self.readers.len() as u32,
+        }
+    }
 }
 
 /// What MediaMTX knows about one published path.
@@ -159,6 +219,10 @@ impl MediaMtx {
         self.cfg.rtsp_port
     }
 
+    pub fn config(&self) -> &MediaMtxConfig {
+        &self.cfg
+    }
+
     fn set(&self, f: impl FnOnce(&mut MediaMtxInfo)) {
         f(&mut self.status.lock().unwrap());
     }
@@ -188,11 +252,13 @@ impl MediaMtx {
         if !resp.status().is_success() {
             return Some(PathState::default()); // 404 = not published (yet)
         }
-        let p = resp.json::<PathInfo>().await.ok()?;
-        Some(PathState {
-            online: p.online,
-            readers: p.readers.len() as u32,
-        })
+        match resp.json::<PathInfo>().await {
+            Ok(p) => Some(p.state()),
+            Err(e) => {
+                tracing::warn!(path = name, "can't parse MediaMTX path info: {e}");
+                None
+            }
+        }
     }
 
     /// Run (and restart) MediaMTX until shutdown.
@@ -259,7 +325,20 @@ impl MediaMtx {
             _ => {}
         }
         std::fs::write(&conf, render_config(&self.cfg, version)).context("writing mediamtx.yml")?;
-        let mut child = Command::new(bin)
+        let mut cmd = Command::new(bin);
+        // If castdeskd dies without a clean shutdown (crash, SIGKILL), the
+        // kernel sends MediaMTX SIGTERM, so it can't linger holding the RTSP
+        // port. (PDEATHSIG tracks the spawning thread: a tokio worker, which
+        // lives as long as the runtime.)
+        unsafe {
+            cmd.pre_exec(|| {
+                if prctl(PR_SET_PDEATHSIG, 15, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd
             .arg(&conf)
             // Anything MediaMTX writes (e.g. generated certs) stays out of the user's cwd.
             .current_dir(&dir)
@@ -308,9 +387,12 @@ impl MediaMtx {
     }
 }
 
+const PR_SET_PDEATHSIG: i32 = 1;
+
 unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
+    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
 
 #[cfg(test)]
@@ -325,6 +407,18 @@ mod tests {
         assert!(parse_version("v1.11.0").unwrap() < MIN_VERSION);
     }
 
+    /// Shape returned by MediaMTX v1.21.3 (trimmed), which has both `ready`
+    /// and `online`. This used to fail to parse, so readers always read 0.
+    #[test]
+    fn parses_path_info_from_v1_21() {
+        let json = r#"{"name":"tv1","ready":true,"online":true,"tracks":["H264"],
+            "readers":[{"type":"rtspSession","id":"a"},{"type":"rtspSession","id":"b"}]}"#;
+        let p: PathInfo = serde_json::from_str(json).unwrap();
+        assert_eq!((p.state().online, p.state().readers), (true, 2));
+        let old: PathInfo = serde_json::from_str(r#"{"ready":true,"readers":[]}"#).unwrap();
+        assert!(old.state().online);
+    }
+
     #[test]
     fn config_restricts_publish_to_localhost() {
         let text = render_config(&MediaMtxConfig::default(), Some((1, 21, 3)));
@@ -336,5 +430,27 @@ mod tests {
         assert!(publish_block.contains("127.0.0.1") && publish_block.contains("publish"));
         let read_block = text.split("- user: any").nth(2).unwrap();
         assert!(read_block.contains("ips: []") && !read_block.contains("publish"));
+    }
+
+    #[test]
+    fn hls_and_webrtc_are_opt_in() {
+        let off = MediaMtxConfig::default();
+        let text = render_config(&off, Some((1, 21, 3)));
+        assert!(text.contains("hls: false") && text.contains("webrtc: false"));
+        assert_eq!(stream_urls(&off, "10.0.0.5", "tv1").len(), 1);
+        assert_eq!(lan_ports(&off).len(), 3);
+
+        let on = MediaMtxConfig { hls: true, webrtc: true, ..Default::default() };
+        let text = render_config(&on, Some((1, 21, 3)));
+        assert!(text.contains("hls: true") && text.contains("hlsAddress: :8888"));
+        assert!(text.contains("hlsVariant: mpegts"));
+        assert!(text.contains("webrtc: true") && text.contains("webrtcLocalUDPAddress: :8189"));
+        let urls: Vec<_> = stream_urls(&on, "10.0.0.5", "tv1").into_iter().map(|u| u.url).collect();
+        assert_eq!(urls, [
+            "rtsp://10.0.0.5:8554/tv1",
+            "http://10.0.0.5:8888/tv1/index.m3u8",
+            "http://10.0.0.5:8889/tv1/",
+        ]);
+        assert_eq!(lan_ports(&on).len(), 6);
     }
 }

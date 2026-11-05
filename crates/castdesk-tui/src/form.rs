@@ -66,7 +66,7 @@ impl AddForm {
                 res,
                 Field::text("FPS", defaults.fps.to_string(), "1-144"),
                 Field::text("Bitrate Mb/s", format!("{}", defaults.bitrate_kbps as f64 / 1000.0), "8-15 recommended on gigabit"),
-                Field::choice("Codec", &["h264", "h265"], "H.265 halves bitrate; check receiver support"),
+                Field::choice("Codec", &["h264", "h265"], "h264 plays everywhere; h265 halves bitrate but many TVs/browsers can't play it"),
                 Field::choice("Encoder", &["auto", "vaapi", "nvenc", "software"], "auto = VA-API → NVENC → x264"),
                 Field::choice("Backend", &backends, "auto = detect from session; test = color bars"),
                 Field::choice("Placement", &placements, "relative to the laptop screen"),

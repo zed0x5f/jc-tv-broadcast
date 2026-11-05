@@ -5,8 +5,10 @@
 //! Testing: no unit tests. The self-test covers add → running, live stats
 //! (bitrate/fps within 25%), recovery after MediaMTX is killed, remove, and the
 //! config file update. Not covered: recreating the virtual display after
-//! repeated failures, `restart`, and startup with displays already in the
-//! config file. Shutdown happens when the self-test sends SIGTERM at the end,
+//! repeated failures and `restart`. Checked by hand on GNOME: startup with
+//! displays already in the config file, four Mutter displays at once (~14% of
+//! one core in total on static screens). The stall detector exists because
+//! one display froze when others were added; it hasn't yet fired for real. Shutdown happens when the self-test sends SIGTERM at the end,
 //! but nothing checks the result.
 
 use std::collections::HashMap;
@@ -17,7 +19,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use castdesk_core::{
     Config, DisplaySpec, DisplayState, DisplayStatus, EncoderInfo, SessionInfo, StreamStats,
-    StreamUrl,
 };
 use futures_util::StreamExt;
 use tokio::sync::{RwLock, mpsc};
@@ -25,8 +26,13 @@ use tokio::task::JoinHandle;
 
 use crate::display::{self, DisplayHandle};
 use crate::encoder;
-use crate::mediamtx::MediaMtx;
+use crate::mediamtx::{self, MediaMtx};
 use crate::pipeline::{self, PipelineParams, StreamPipeline};
+
+/// No new frame for this long = the capture is stuck; recreate the display.
+/// Generous enough for slow first negotiation (the virtual display is created
+/// before the pipeline, so the counter starts at pipeline start).
+const STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Failures in a row before the virtual display itself is recreated.
 const RECREATE_DISPLAY_AFTER: u32 = 3;
@@ -149,10 +155,10 @@ impl Manager {
         }
         // Fail fast on an impossible encoder choice instead of looping.
         let enc = encoder::choose(&self.ctx.encoders, &spec.video)?;
-        let urls = vec![StreamUrl {
-            kind: "rtsp".into(),
-            url: format!("rtsp://{}:{}/{}", self.ctx.host, self.ctx.mediamtx.rtsp_port(), spec.name),
-        }];
+        for w in spec.video.compat_warnings() {
+            tracing::warn!(display = %spec.name, "receiver compatibility: {w}");
+        }
+        let urls = mediamtx::stream_urls(self.ctx.mediamtx.config(), &self.ctx.host, &spec.name);
         let status = Arc::new(Mutex::new(DisplayStatus {
             spec: spec.clone(),
             state: DisplayState::Starting,
@@ -290,9 +296,23 @@ impl Actor {
             ),
         };
         let sp = pipeline::build(&params)?;
-        sp.pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|_| anyhow!("pipeline refused to start (see daemon log)"))?;
+        if sp.pipeline.set_state(gst::State::Playing).is_err() {
+            // The reason is posted on the bus as an Error message.
+            let reason = sp
+                .pipeline
+                .bus()
+                .and_then(|bus| bus.pop_filtered(&[gst::MessageType::Error]))
+                .and_then(|m| match m.view() {
+                    gst::MessageView::Error(e) => Some(format!(
+                        "{} ({})",
+                        e.error(),
+                        e.debug().map(|d| d.to_string()).unwrap_or_default()
+                    )),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "no error message posted".into());
+            bail!("pipeline refused to start: {reason}");
+        }
         Ok(sp)
     }
 
@@ -306,6 +326,12 @@ impl Actor {
         );
         let started = Instant::now();
         let (mut last_frames, mut last_bytes, mut last_t) = (0u64, 0u64, Instant::now());
+        // Last time the frame counter moved. Sources always deliver frames
+        // (pipewiresrc's keepalive resends the last one every 0.5 s on a static
+        // screen), so a long gap means the capture stalled. Seen on GNOME: an
+        // existing Mutter stream froze when more virtual monitors were added,
+        // while the bus reported nothing.
+        let mut last_progress = Instant::now();
         loop {
             tokio::select! {
                 msg = messages.next() => {
@@ -334,6 +360,14 @@ impl Actor {
                 _ = tick.tick() => {
                     let frames = sp.counters.frames.load(Ordering::Relaxed);
                     let bytes = sp.counters.bytes.load(Ordering::Relaxed);
+                    if frames != last_frames {
+                        last_progress = Instant::now();
+                    } else if last_progress.elapsed() > STALL_TIMEOUT {
+                        return Outcome::Failed {
+                            error: format!("capture stalled: no frames for {} s", STALL_TIMEOUT.as_secs()),
+                            display_gone: true, // recreate the virtual display
+                        };
+                    }
                     let dt = last_t.elapsed().as_secs_f64().max(0.001);
                     let path = self.ctx.mediamtx.path(&self.spec.name).await;
                     let mut st = self.status.lock().unwrap();
