@@ -6,8 +6,11 @@ It's all Rust: `castdeskd` (daemon) + `castdesk-tui` (terminal UI), with the
 soft remote coming in a later stage.
 
 > **Status: stage (a) — virtual display + RTSP stream + TUI.**
-> Only the headless path has been tested end to end; the real desktop backends
-> and hardware encoders have not (see [Test status](#test-status)).
+> Tested end to end on GNOME (Wayland) with an Intel GPU (`mutter` backend,
+> `vah264enc`) and headless (`test` backend, x264). The `portal` (KDE),
+> `wlroots` (Sway/Hyprland) and `x11` backends are **experimental**: written
+> and unit-tested, but never run against a real desktop. NVENC and AMD
+> VA-API are untested too (see [Test status](#test-status)).
 > SRT/UDP fan-out, audio, latency overlay and the soft remote are stubbed out
 > and next (see [Roadmap](#roadmap)).
 
@@ -59,10 +62,10 @@ flowchart LR
 
 | Session | Backend | How | Trade-offs |
 |---|---|---|---|
-| GNOME Wayland | `mutter` | `org.gnome.Mutter.ScreenCast` `RecordVirtual` over D-Bus | Best. No dialog; the size you choose *is* the monitor size. The monitor lives as long as the stream. Some locked-down GNOME builds deny this private API (AccessDenied); then `auto` falls back to `portal`. Placement is set in GNOME Settings → Displays for now. |
-| KDE Plasma 6 Wayland (and GNOME fallback) | `portal` | xdg-desktop-portal ScreenCast, source type **VIRTUAL** | Standard API. One permission dialog the first time; after that a restore token (in `~/.local/state/castdesk/portal-tokens.json`) makes it silent. The compositor decides the initial mode; we scale to your resolution. |
-| Sway / Hyprland | `wlroots` | `swaymsg create_output` / `hyprctl output create headless`, then portal MONITOR capture | Exact mode and position control. xdg-desktop-portal-wlr shows an output chooser the first time (pick `HEADLESS-n`). |
-| X11 (any WM) | `x11` | `xrandr --fb` grows the root window; `xrandr --setmonitor CastDesk-<name> … none` declares a RandR monitor on the new area; `ximagesrc` captures it | Needs no driver. Right-of / below only. WMs must honour RandR 1.5 monitors (GNOME/KDE/XFCE/i3 do). The area isn't scanned out, so capture uses CPU copies. |
+| GNOME Wayland | `mutter` | `org.gnome.Mutter.ScreenCast` `RecordVirtual` over D-Bus | **Tested** by hand on GNOME 50 / Ubuntu 26.04. Best. No dialog; the size you choose *is* the monitor size. The monitor lives as long as the stream. Some locked-down GNOME builds deny this private API (AccessDenied); then `auto` falls back to `portal`. Placement is set in GNOME Settings → Displays for now. |
+| KDE Plasma 6 Wayland (and GNOME fallback) | `portal` | xdg-desktop-portal ScreenCast, source type **VIRTUAL** | **Experimental: never run on a real desktop.** Standard API. One permission dialog the first time; after that a restore token (in `~/.local/state/castdesk/portal-tokens.json`) makes it silent. The compositor decides the initial mode; we scale to your resolution. |
+| Sway / Hyprland | `wlroots` | `swaymsg create_output` / `hyprctl output create headless`, then portal MONITOR capture | **Experimental: never run on a real desktop.** Exact mode and position control. xdg-desktop-portal-wlr shows an output chooser the first time (pick `HEADLESS-n`). |
+| X11 (any WM) | `x11` | `xrandr --fb` grows the root window; `xrandr --setmonitor CastDesk-<name> … none` declares a RandR monitor on the new area; `ximagesrc` captures it | **Experimental: never run against an X server.** Needs no driver. Right-of / below only. WMs must honour RandR 1.5 monitors (GNOME/KDE/XFCE/i3 do). The area isn't scanned out, so capture uses CPU copies. |
 | any | `evdi` | DisplayLink's evdi kernel module creates a real DRM connector | **Stub, planned for stage (b).** Rejected as not implemented today. Will need root + DKMS (and MOK signing with Secure Boot). Only if none of the above work for you. |
 | headless | `test` | SMPTE bars + running clock | For verifying the network path without touching your desktop. |
 
@@ -307,7 +310,7 @@ curl -H "Authorization: Bearer $T" -XDELETE localhost:7650/api/v1/displays/tv2
 
 ## Roadmap
 
-- [x] **(a)** virtual display (Mutter / portal / wlroots / X11) → one encode → RTSP via MediaMTX; health monitoring + auto-restart; TUI. Code complete; only the headless path is tested (see [Test status](#test-status))
+- [x] **(a)** virtual display (Mutter / portal / wlroots / X11) → one encode → RTSP via MediaMTX (+ optional HLS/WebRTC); health monitoring + auto-restart; TUI. Done and tested on GNOME + Intel and headless; portal, wlroots and X11 are experimental (see [Test status](#test-status))
 - [ ] **(b)** *(stubbed)* SRT listener + MPEG-TS UDP unicast/multicast branches, toggled live with no encoder restart; audio (PipeWire sink monitor → AAC/Opus); latency-test overlay; Mutter placement via DisplayConfig; evdi backend
 - [ ] **(c)** *(stubbed)* soft remote: ADB → Android TV Remote v2 (own Rust implementation) → CastDesk WebSocket protocol (`docs/control-protocol.md`) + Kotlin/Media3 receiver (`receivers/media3/`); optional CEC
 
