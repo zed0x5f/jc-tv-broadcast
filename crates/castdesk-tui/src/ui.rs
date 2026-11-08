@@ -211,6 +211,10 @@ pub fn detail_lines(d: &DisplayStatus) -> Vec<Line<'static>> {
         ),
     ));
     lines.push(kv("Encoder", d.encoder.clone().unwrap_or_else(|| "…".into())));
+    if d.spec.latency_overlay {
+        let url = d.urls.first().map(|u| u.url.as_str()).unwrap_or("<url>");
+        lines.push(kv("Latency", Span::raw(format!("overlay on — measure: castdeskd latency {url}")).yellow()));
+    }
     lines.push(Line::from(""));
     lines.push(kv(
         "Live",

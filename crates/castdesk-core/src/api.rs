@@ -271,7 +271,9 @@ pub struct DisplaySpec {
     /// STUB (stage b): capture desktop audio (PipeWire sink monitor). Must be false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub audio: bool,
-    /// STUB (stage b): burn a latency-test overlay into the stream. Must be false.
+    /// Burn the capture time into every frame (text + machine-readable block
+    /// code, top-left) so `castdeskd latency <url>` can measure end-to-end
+    /// latency. For testing: it covers part of the picture.
     #[serde(default, skip_serializing_if = "is_false")]
     pub latency_overlay: bool,
 }
@@ -305,9 +307,6 @@ impl DisplaySpec {
         }
         if self.audio {
             return Err(not_implemented("audio", "b"));
-        }
-        if self.latency_overlay {
-            return Err(not_implemented("the latency overlay", "b"));
         }
         Ok(())
     }

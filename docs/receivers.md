@@ -61,6 +61,14 @@ Enabled outputs show up in the TUI and in the API's `urls` list. Ports to
 open: HLS 8888/tcp; WebRTC 8889/tcp and 8189/udp (all configurable:
 `hls_port`, `webrtc_port`, `webrtc_udp_port`).
 
+## Measuring latency on a receiver
+
+Turn on `latency_overlay` for the display and run
+`castdeskd latency <url>` on the receiver (any Linux box with GStreamer), or on
+the laptop itself. It prints min/median/p95/max latency from capture to decoded
+frame. See the README section "Measure latency" for what's included and how to
+do glass-to-glass with a camera. Please add numbers to the notes column below.
+
 ## Compatibility matrix
 
 ✅ = played, checked by hand or by the self-test. ❔ = not tried yet. Please

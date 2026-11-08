@@ -70,6 +70,7 @@ impl AddForm {
                 Field::choice("Encoder", &["auto", "vaapi", "nvenc", "software"], "auto = VA-API → NVENC → x264"),
                 Field::choice("Backend", &backends, "auto = detect from session; test = color bars"),
                 Field::choice("Placement", &placements, "relative to the laptop screen"),
+                Field::choice("Latency overlay", &["off", "on"], "stamp capture time into the picture; measure with `castdeskd latency <url>`"),
             ],
             focus: 0,
             error: None,
@@ -134,7 +135,7 @@ impl AddForm {
             // Stage (b) stubs, not offered in the form yet.
             destinations: Vec::new(),
             audio: false,
-            latency_overlay: false,
+            latency_overlay: self.get("Latency overlay") == "on",
         };
         spec.validate()?;
         Ok(spec)

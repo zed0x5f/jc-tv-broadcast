@@ -11,8 +11,8 @@ soft remote coming in a later stage.
 > `wlroots` (Sway/Hyprland) and `x11` backends are **experimental**: written
 > and unit-tested, but never run against a real desktop. NVENC and AMD
 > VA-API are untested too (see [Test status](#test-status)).
-> SRT/UDP fan-out, audio, latency overlay and the soft remote are stubbed out
-> and next (see [Roadmap](#roadmap)).
+> Stage (b) has started: the latency overlay and `castdeskd latency` work.
+> SRT/UDP fan-out, audio and the soft remote are stubbed out and next (see [Roadmap](#roadmap)).
 
 ```mermaid
 flowchart LR
@@ -134,11 +134,12 @@ bitrate_kbps = 12000
 codec = "h264"              # h264 (plays everywhere) | h265 (many TVs/browsers can't)
 encoder = "auto"            # auto | vaapi | nvenc | software
 gop_seconds = 1.0
+latency_overlay = false     # true = stamp capture time into the picture (see "Measure latency")
 ```
 
 Stage (b) settings already parse but are **rejected as not implemented**, so
-they can't silently do nothing: `destinations = [...]` (SRT/UDP), `audio = true`,
-`latency_overlay = true` and `backend = "evdi"`. A config file that contains
+they can't silently do nothing: `destinations = [...]` (SRT/UDP), `audio = true`
+and `backend = "evdi"`. A config file that contains
 any of them stops the daemon from starting, with an error that names the
 setting.
 
@@ -169,7 +170,7 @@ copy-paste player commands.
 scripts/selftest-stage-a.sh          # uses ~/.local/share/castdesk/bin/mediamtx
 ```
 
-Success is thirteen `PASS` lines ending in `stage (a) self-test OK` (one
+Success is fourteen `PASS` lines ending in `stage (a) self-test OK` (one
 `WARN` about colour tags is expected with `vah264enc`, see
 [docs/receivers.md](docs/receivers.md)). It uses its own ports (17650/18554/
 18888/18889), so it can run next to your real daemon. `ENCODER=software`
@@ -215,6 +216,34 @@ Which players and TVs work, and the HLS/WebRTC fallbacks:
 come back to `running` within about 7 s. Viewers reconnect: mpv/ffplay do it
 on their own; VLC needs a replay.
 
+### Measure latency
+
+Turn on the overlay for a display (`latency_overlay = true`, or "Latency
+overlay: on" in the TUI's add form). Each frame then carries its capture time,
+as text and as a block code in the top-left corner. Then:
+
+```bash
+castdeskd latency rtsp://<laptop>:8554/tv1            # 10 s, RTSP over TCP
+castdeskd latency --udp --seconds 30 rtsp://<laptop>:8554/tv1
+# e.g. (self-test, 3 s, vah264enc):
+# 92 frames, 67 with a code (25 before the first keyframe): latency min 60 / median 64 / p95 66 / max 74 ms
+```
+
+- **On the laptop itself** it needs no clock sync and measures capture →
+  convert → encode → MediaMTX → network stack → decode. With the `test`
+  backend at 720p30: median **63 ms with vah264enc** (Intel) and **95 ms with
+  x264enc**.
+- **On another machine** (a Pi, another laptop) it also includes the real
+  network, but both clocks must be NTP-synced. Negative numbers mean the
+  receiver's clock is behind.
+- **Glass to glass** (including the TV's own processing): photograph the TV
+  next to a clock showing UTC with milliseconds and compare it with the
+  overlay's `HH:MM:SS.mmm UTC` text.
+
+Frames decoded before the first keyframe can't be read; the count is shown
+separately. Every frame after that should carry a code. The overlay covers
+part of the top-left corner, so turn it off for normal use.
+
 ## Test status
 
 What has actually been run, as of this commit. Each source file's header
@@ -227,13 +256,14 @@ comment says the same thing for that file.
 | `mutter` backend | by hand on GNOME (Wayland), Ubuntu 26.04: monitor appears, 1080p30 stream decodes over RTSP/UDP, recreated from config on start | AccessDenied → `portal` fallback; window moved onto it under load |
 | `portal` backend | — | **never run** against KDE or GNOME |
 | `wlroots` / `x11` backends | unit tests for output parsing and placement math | **never run** against Sway, Hyprland or an X server |
-| `test` backend → encoder → MediaMTX → RTSP/HLS/WebRTC | `scripts/selftest-stage-a.sh`: all 13 checks pass on an Ubuntu 26.04 Intel laptop (GStreamer 1.28.2, MediaMTX v1.21.3) with both `vah264enc` (`auto`; warns: no colour tags) and `x264enc` (`ENCODER=software`). The earlier 9-check version also passed in an Ubuntu 24.04 container (x264enc, no GPU). | the 13-check version on 24.04; WebRTC media (only the player page is fetched) |
+| `test` backend → encoder → MediaMTX → RTSP/HLS/WebRTC | `scripts/selftest-stage-a.sh`: all 14 checks pass on an Ubuntu 26.04 Intel laptop (GStreamer 1.28.2, MediaMTX v1.21.3) with both `vah264enc` (`auto`; warns: no colour tags) and `x264enc` (`ENCODER=software`). The earlier 9-check version also passed in an Ubuntu 24.04 container (x264enc, no GPU). | the 14-check version on 24.04; WebRTC media (only the player page is fetched) |
 | Encoders | x264enc/x265enc probe + encode; selection logic unit-tested; Intel Comet Lake: vah264enc streams, vah265enc probes OK, vah264lpenc rejected (no CBR in low-power mode) | NVENC, AMD VA-API |
 | Daemon supervision | self-test, and by hand on GNOME: MediaMTX kill → back to `running` in ~7 s; RTSP client count; 4 displays at once; 3 viewers on one display | recreating the virtual display after repeated failures; the stall detector (added after an intermittent freeze); `restart` endpoint |
 | Control API | self-test: 401 without token, add/get/delete display | `/system`, `/health`, list, `restart` |
 | TUI | rendering + add form (ratatui TestBackend, canned data) | against a live daemon; start/stop daemon, logs, clipboard |
 | Dependency checker | 19 Python tests on faked machines; `install.sh` run end to end on Ubuntu 26.04 (GNOME, Intel) | Ubuntu 24.04, KDE, Sway, NVIDIA machines |
 | Receivers | ffprobe/ffmpeg over RTSP TCP and UDP, and over HLS (self-test, which also checks profile, level ≤ 4.2, yuv420p and colour tags); GStreamer rtspsrc + vah264dec and ffmpeg over the LAN address; join time on a static screen measured | VLC with live555 (Ubuntu's VLC can't play RTSP), mpv, Raspberry Pi, Android TV, another machine on the LAN |
+| Latency overlay + `castdeskd latency` | unit tests (code layout, NV12/I420 painting, H.264 round trip at 500 kb/s: every frame after the first keyframe readable); self-test measures latency through MediaMTX with vah264enc and x264enc | on a real desktop source (PipeWire/X11); from another machine; glass-to-glass with a camera |
 | Stage (b)/(c) stubs | each stub's "not implemented" error | — (no functionality yet) |
 
 ## Setup notes per desktop
@@ -311,7 +341,7 @@ curl -H "Authorization: Bearer $T" -XDELETE localhost:7650/api/v1/displays/tv2
 ## Roadmap
 
 - [x] **(a)** virtual display (Mutter / portal / wlroots / X11) → one encode → RTSP via MediaMTX (+ optional HLS/WebRTC); health monitoring + auto-restart; TUI. Done and tested on GNOME + Intel and headless; portal, wlroots and X11 are experimental (see [Test status](#test-status))
-- [ ] **(b)** *(stubbed)* SRT listener + MPEG-TS UDP unicast/multicast branches, toggled live with no encoder restart; audio (PipeWire sink monitor → AAC/Opus); latency-test overlay; Mutter placement via DisplayConfig; evdi backend
+- [ ] **(b)** *(in progress)* ~~latency-test overlay~~ (done: overlay + `castdeskd latency`); SRT listener + MPEG-TS UDP unicast/multicast branches, toggled live with no encoder restart; audio (PipeWire sink monitor → AAC); Mutter placement via DisplayConfig; evdi backend
 - [ ] **(c)** *(stubbed)* soft remote: ADB → Android TV Remote v2 (own Rust implementation) → CastDesk WebSocket protocol (`docs/control-protocol.md`) + Kotlin/Media3 receiver (`receivers/media3/`); optional CEC
 
 The GTK4 widget / tray stage was dropped. The TUI and the REST API are the

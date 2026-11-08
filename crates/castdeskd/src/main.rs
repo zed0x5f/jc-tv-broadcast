@@ -11,7 +11,7 @@ mod display;
 mod encoder;
 mod manager;
 mod mediamtx;
-mod overlay; // stub, stage (b)
+mod overlay; // stage (b): latency overlay + `castdeskd latency`
 mod pipeline;
 mod remote; // stub, stage (c)
 mod session;
@@ -41,6 +41,23 @@ enum Cmd {
     Run,
     /// Print detected session, backends and working encoders, then exit.
     Doctor,
+    /// Measure a stream's latency. The display needs `latency_overlay = true`.
+    ///
+    /// Plays the URL, reads the capture time stamped into each frame and
+    /// prints min/median/p95/max of (now − capture time). Run it on the laptop
+    /// for capture → encode → network → decode latency without clock sync; on
+    /// another machine both clocks must be NTP-synced. The receiver's display
+    /// isn't included: photograph the TV next to a clock for that.
+    Latency {
+        /// rtsp://… or http(s)://… (HLS) URL, as shown in the TUI.
+        url: String,
+        /// How long to measure, from the first frame.
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+        /// Use RTSP over UDP instead of TCP.
+        #[arg(long)]
+        udp: bool,
+    },
 }
 
 /// LAN address used in advertised URLs. Connecting a UDP socket sends nothing.
@@ -79,6 +96,15 @@ async fn main() -> Result<()> {
     let cfg = Config::load(&config_path)?;
 
     gst::init().context("initialising GStreamer")?;
+    if let Some(Cmd::Latency { url, seconds, udp }) = &cli.cmd {
+        let (url, seconds, tcp) = (url.clone(), *seconds, !*udp);
+        let report = tokio::task::spawn_blocking(move || overlay::measure(&url, seconds, tcp)).await??;
+        println!("{}", report.summary());
+        if report.samples.is_empty() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let session = session::detect(&session::current_env());
     let encoders = tokio::task::spawn_blocking(encoder::probe_all).await?;
 

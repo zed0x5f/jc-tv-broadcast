@@ -1,7 +1,7 @@
 //! `~/.config/castdesk/config.toml`
 //!
 //! Testing: defaults, TOML round trip, minimal user file, validation, save/load
-//! and stage (b) stub rejection are unit-tested.
+//! and stage (b) stub rejection (SRT/UDP, audio, evdi) are unit-tested.
 
 use std::path::{Path, PathBuf};
 
@@ -245,14 +245,16 @@ mod tests {
 
         for spec in [
             DisplaySpec { audio: true, ..DisplaySpec::new("a") },
-            DisplaySpec { latency_overlay: true, ..DisplaySpec::new("a") },
             DisplaySpec { backend: BackendKind::Evdi, ..DisplaySpec::new("a") },
         ] {
             assert!(spec.validate().unwrap_err().contains("not implemented"));
         }
+        // The latency overlay is implemented now.
+        assert!(DisplaySpec { latency_overlay: true, ..DisplaySpec::new("a") }.validate().is_ok());
         // Defaults stay out of the saved file.
         let text = toml::to_string(&DisplaySpec::new("a")).unwrap();
         assert!(!text.contains("audio") && !text.contains("destinations"));
+        assert!(!text.contains("latency_overlay"));
         assert!(!BackendKind::ALL.contains(&BackendKind::Evdi));
     }
 

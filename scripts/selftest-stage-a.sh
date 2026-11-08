@@ -63,7 +63,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' $API/displays)
 [[ $code == 401 ]] && pass "API rejects requests without token" || fail "expected 401, got $code"
 
 curl -sf -H "$H" -H 'content-type: application/json' -X POST $API/displays \
-  -d '{"name":"selftest","backend":"test","encoder":"'"${ENCODER:-auto}"'","width":1280,"height":720,"fps":30,"bitrate_kbps":4000}' >/dev/null \
+  -d '{"name":"selftest","backend":"test","encoder":"'"${ENCODER:-auto}"'","width":1280,"height":720,"fps":30,"bitrate_kbps":4000,"latency_overlay":true}' >/dev/null \
   && pass "created test display" || fail "create display"
 
 for _ in $(seq 40); do
@@ -114,6 +114,16 @@ code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18889/selftest/)
 
 urls=$(curl -s -H "$H" $API/displays/selftest | python3 -c 'import json,sys;print(" ".join(u["kind"] for u in json.load(sys.stdin)["urls"]))')
 [[ $urls == "rtsp hls webrtc" ]] && pass "API advertises RTSP, HLS and WebRTC URLs" || fail "urls: $urls"
+
+# The display has latency_overlay on: measure capture → encode → MediaMTX →
+# decode on this machine (same clock, so no sync needed).
+lat=$("$ROOT/target/debug/castdeskd" latency --seconds 3 rtsp://127.0.0.1:18554/selftest 2>"$WORK/latency.log") \
+  || fail "castdeskd latency: $lat $(tail -5 "$WORK/latency.log")"
+med=$(sed -n 's/.*median \(-\{0,1\}[0-9]*\) .*/\1/p' <<<"$lat")
+# Every frame after the first keyframe must carry a readable code.
+read -r n m k < <(sed -n 's/^\([0-9]*\) frames, \([0-9]*\) with a code (\([0-9]*\) before.*/\1 \2 \3/p' <<<"$lat")
+[[ -n $med && $med -ge 0 && $med -lt 1000 && $((m + k)) == "$n" ]] \
+  && pass "latency (RTSP/TCP, local): $lat" || fail "latency: $lat"
 
 sleep 1.5
 stats=$(curl -s -H "$H" $API/displays/selftest)

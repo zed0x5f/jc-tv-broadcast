@@ -26,6 +26,7 @@ use gst::prelude::*;
 
 use crate::display::CaptureSource;
 use crate::encoder;
+use crate::overlay;
 
 pub struct PipelineParams<'a> {
     pub video: &'a VideoSettings,
@@ -33,6 +34,8 @@ pub struct PipelineParams<'a> {
     pub source: &'a CaptureSource,
     /// Where to publish, e.g. rtsp://127.0.0.1:8554/tv1
     pub rtsp_publish: String,
+    /// Stamp capture time into every frame (see `overlay.rs`).
+    pub latency_overlay: bool,
 }
 
 #[derive(Default)]
@@ -120,7 +123,7 @@ pub fn description(p: &PipelineParams<'_>) -> String {
          ! queue name=capq max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
          ! videoconvert n-threads=4 ! videoscale \
          ! video/x-raw,format={fmt},width={w},height={h},pixel-aspect-ratio=1/1,colorimetry=bt709 \
-         ! queue name=encq max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
+         {overlay}! queue name=encq max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
          ! {enc} name=enc \
          ! {enc_caps} \
          ! {parser} config-interval=-1 \
@@ -133,6 +136,11 @@ pub fn description(p: &PipelineParams<'_>) -> String {
         h = v.height,
         enc = p.encoder,
         enc_caps = encoder::output_caps(v.codec),
+        overlay = if p.latency_overlay {
+            format!("! {} ", overlay::description(v.width, v.height))
+        } else {
+            String::new()
+        },
         fmt = encoder::input_format(p.encoder),
         url = p.rtsp_publish,
     )
@@ -256,6 +264,9 @@ pub fn build(p: &PipelineParams<'_>) -> Result<StreamPipeline> {
     }
     let q_rtsp = pipeline.by_name("q_rtsp").ok_or_else(|| anyhow!("no q_rtsp"))?;
     guard_encoded_queue(&q_rtsp, counters.clone());
+    if p.latency_overlay {
+        overlay::install(&pipeline)?;
+    }
 
     Ok(StreamPipeline { pipeline, counters })
 }
@@ -313,12 +324,13 @@ mod tests {
         for cand in encoder::CANDIDATES {
             used.insert(cand.element.to_string());
             let v = VideoSettings { codec: cand.codec, ..Default::default() };
-            for src in &sources {
+            for (src, latency_overlay) in sources.iter().flat_map(|s| [(s, false), (s, true)]) {
                 let p = PipelineParams {
                     video: &v,
                     encoder: cand.element,
                     source: src,
                     rtsp_publish: "rtsp://127.0.0.1:1/x".into(),
+                    latency_overlay,
                 };
                 for segment in description(&p).split('!') {
                     let el = segment.split_whitespace().next().unwrap_or_default();
@@ -344,14 +356,25 @@ mod tests {
             encoder: "x264enc",
             source: &CaptureSource::Test,
             rtsp_publish: "rtsp://127.0.0.1:1/x".into(),
+            latency_overlay: false,
         };
         let d = description(&p);
+        assert!(!d.contains(overlay::STAMP));
+        let with_overlay = PipelineParams {
+            rtsp_publish: p.rtsp_publish.clone(),
+            latency_overlay: true,
+            ..p
+        };
+        let d2 = description(&with_overlay);
+        assert!(d2.contains("colorimetry=bt709 ! identity name=latency_stamp"));
+        assert!(d2.contains("shaded-background=true ! queue name=encq"));
         assert!(d.contains("h264parse config-interval=-1"));
         assert!(d.contains("colorimetry=bt709"));
         assert!(d.contains("! video/x-h264,profile=(string){high,main,constrained-baseline} !"));
         if gst::ElementFactory::find("x264enc").is_some()
             && gst::ElementFactory::find("rtspclientsink").is_some()
         {
+            build(&with_overlay).expect("pipeline with latency overlay builds");
             let sp = build(&p).expect("pipeline builds");
             let enc = sp.pipeline.by_name("enc").unwrap();
             assert_eq!(enc.property::<u32>("bframes"), 0);

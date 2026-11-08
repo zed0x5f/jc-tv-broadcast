@@ -286,6 +286,7 @@ impl Actor {
             bail!("RTSP server not listening on :{} {msg}", self.ctx.mediamtx.rtsp_port());
         }
         let params = PipelineParams {
+            latency_overlay: self.spec.latency_overlay,
             video: &self.spec.video,
             encoder: &self.encoder,
             source: handle.source(),

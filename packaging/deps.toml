@@ -146,7 +146,7 @@ phase = "runtime"
 level = "required"
 what = "timeoverlay / textoverlay (pango)"
 why = "test pattern clock and the latency-test overlay"
-probe = { kind = "gst-element", elements = ["timeoverlay"], plugin = "pango" }
+probe = { kind = "gst-element", elements = ["timeoverlay", "textoverlay"], plugin = "pango" }
 apt = "gstreamer1.0-x"
 
 [[dep]]
@@ -221,6 +221,16 @@ what = "pkill"
 why = "TUI stops a non-systemd daemon; self-test"
 probe = { kind = "binary", name = "pkill" }
 apt = "procps"
+
+[[dep]]
+id = "gst-latency-receiver"
+phase = "runtime"
+level = "optional"
+what = "rtspsrc, decodebin, uridecodebin"
+why = "`castdeskd latency <url>`: plays a stream to measure its latency"
+probe = { kind = "gst-element", elements = ["rtspsrc", "decodebin", "uridecodebin"], plugin = ["rtsp", "playback"] }
+apt = ["gstreamer1.0-plugins-good"]
+hint = "also needs an H.264 decoder: the VA-API one (gstreamer1.0-plugins-bad + a VA driver) or avdec_h264 (gstreamer1.0-libav)"
 
 [[dep]]
 id = "ffmpeg"
